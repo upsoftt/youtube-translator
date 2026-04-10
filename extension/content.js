@@ -82,6 +82,8 @@ class YouTubeTranslator {
     this._origVolume     = 1.0;
     this._transVolume    = 1.0;
     this._btnPosObs      = null;
+    this._btnPosTimer    = null;
+    this._btnPosResize   = null;
   }
 
   async init() {
@@ -288,36 +290,62 @@ class YouTubeTranslator {
     const btn = document.createElement('button');
     btn.id    = 'ytt-btn';
     btn.title = 'YouTube Translator';
-    // Стиль под Shorts: круглая кнопка как другие действия справа
+    // position:fixed — не в DOM YouTube, не конфликтует ни с чем
     btn.style.cssText =
-      'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
-      'width:48px;height:56px;background:none;border:none;cursor:pointer;' +
-      'color:#fff;padding:4px 0;';
-    btn.innerHTML =
-      this._svgLogo('idle') +
-      '<span style="font-size:11px;margin-top:2px;color:#fff;font-family:Roboto,Arial,sans-serif;">A/文</span>';
+      'position:fixed;z-index:10000;pointer-events:all;' +
+      'display:flex;align-items:center;justify-content:center;' +
+      'width:36px;height:36px;border-radius:50%;' +
+      'background:rgba(0,0,0,0.55);border:none;cursor:pointer;' +
+      'opacity:0.9;transition:opacity 0.15s;';
+    btn.innerHTML = this._svgLogo('idle');
+    btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
+    btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.9'; });
     btn.addEventListener('click', (e) => { e.stopPropagation(); this._togglePanel(); });
     this.btnEl = btn;
+    document.body.appendChild(btn);
 
-    // Вставляем в правую панель действий Shorts
-    this._tryInsertShortsBtn(btn, 0);
+    // Позиционируем слева от кнопки звука — обновляем при каждом изменении
+    this._trackShortsVolumeBtn();
   }
 
-  _tryInsertShortsBtn(btn, attempt) {
-    if (btn.isConnected) return;
-    if (attempt > 20) return;
+  // Ищет кнопку звука в Shorts и ставит нашу кнопку слева от неё
+  _trackShortsVolumeBtn() {
+    const SELECTORS = [
+      '#shorts-player .ytp-mute-button',
+      '#shorts-player .ytp-volume-area',
+      '#shorts-player .ytp-volume-panel',
+      // Fallback: любая кнопка mute в плеере
+      '.ytp-mute-button',
+      '.ytp-volume-area',
+    ];
 
-    // Несколько вариантов селектора — YouTube регулярно меняет DOM Shorts
-    const panel = document.querySelector('ytd-shorts-action-panel-renderer #actions')
-               || document.querySelector('ytd-shorts-action-panel-renderer')
-               || document.querySelector('#shorts-inner-container #actions')
-               || document.querySelector('ytd-reel-video-renderer #actions');
+    const findVolBtn = () => {
+      for (const sel of SELECTORS) {
+        const el = document.querySelector(sel);
+        if (el) return el;
+      }
+      return null;
+    };
 
-    if (panel) {
-      panel.insertBefore(btn, panel.firstChild);
-      if (btn.isConnected) return;
-    }
-    setTimeout(() => this._tryInsertShortsBtn(btn, attempt + 1), 300);
+    const update = () => {
+      if (!this.btnEl) return;
+      const volBtn = findVolBtn();
+      if (!volBtn) return; // ещё не появилась — ждём
+
+      const rect   = volBtn.getBoundingClientRect();
+      const btnH   = 36;
+      const top    = rect.top + Math.round((rect.height - btnH) / 2);
+      const left   = rect.left - btnH - 6; // 6px зазор
+
+      this.btnEl.style.top   = Math.max(0, top)  + 'px';
+      this.btnEl.style.left  = Math.max(0, left) + 'px';
+      this.btnEl.style.right = '';     // убираем right если был
+    };
+
+    update();
+    this._btnPosTimer  = setInterval(update, 800);
+    this._btnPosResize = update;
+    window.addEventListener('resize', this._btnPosResize, { passive: true });
   }
 
   _injectButton(player) {
@@ -373,7 +401,12 @@ class YouTubeTranslator {
   }
 
   _stopBtnTracking() {
-    if (this._btnPosObs) { this._btnPosObs.disconnect(); this._btnPosObs = null; }
+    if (this._btnPosObs)    { this._btnPosObs.disconnect(); this._btnPosObs = null; }
+    if (this._btnPosTimer)  { clearInterval(this._btnPosTimer); this._btnPosTimer = null; }
+    if (this._btnPosResize) {
+      window.removeEventListener('resize', this._btnPosResize);
+      this._btnPosResize = null;
+    }
   }
 
   _svgLogo(state) {
@@ -597,6 +630,16 @@ class YouTubeTranslator {
     if (!this.panelEl) return;
     this.panelEl.style.display = 'block';
     this.panelOpen = true;
+
+    // В Shorts панель position:fixed — позиционируем рядом с кнопкой
+    if (this._isShorts() && this.btnEl) {
+      const r = this.btnEl.getBoundingClientRect();
+      this.panelEl.style.bottom = '';
+      this.panelEl.style.top    = Math.max(4, r.bottom - 280) + 'px';
+      this.panelEl.style.right  = '';
+      this.panelEl.style.left   = Math.max(4, r.left - 288) + 'px'; // 280 + 8gap
+    }
+
     // Обновляем значения слайдеров на случай если изменились
     const origSlider = this.panelEl.querySelector('#ytt-orig-vol');
     const origVal    = this.panelEl.querySelector('#ytt-orig-val');
@@ -627,6 +670,9 @@ class YouTubeTranslator {
           if (this.isActive) this._stopTranslation();
           this._stopBtnTracking();
           this.overlay?.remove();
+          // В Shorts кнопка и панель крепятся к document.body
+          document.getElementById('ytt-btn')?.remove();
+          document.getElementById('ytt-panel')?.remove();
           document.getElementById('ytt-style')?.remove();
           this.overlay = this.subtitleEl = this.btnEl = this.panelEl = null;
           this.settings = await this._loadSettings();
