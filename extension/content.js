@@ -291,14 +291,13 @@ class YouTubeTranslator {
     btn.id    = 'ytt-btn';
     btn.title = 'YouTube Translator';
     // position:fixed — не в DOM YouTube, не конфликтует ни с чем
-    // bottom/left — начальная видимая позиция до нахождения кнопки громкости
     btn.style.cssText =
       'position:fixed;z-index:10000;pointer-events:all;' +
       'display:flex;align-items:center;justify-content:center;' +
       'width:36px;height:36px;border-radius:50%;' +
       'background:rgba(0,0,0,0.55);border:none;cursor:pointer;' +
       'opacity:0.9;transition:opacity 0.15s;' +
-      'bottom:80px;left:12px;';
+      'top:-200px;left:-200px;'; // скрыта до нахождения позиции
     btn.innerHTML = this._svgLogo('idle');
     btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
     btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.9'; });
@@ -310,9 +309,12 @@ class YouTubeTranslator {
     this._trackShortsVolumeBtn();
   }
 
-  // Ищет кнопку звука в Shorts и позиционирует нашу кнопку слева от неё
-  _trackShortsVolumeBtn() {
-    const SELECTORS = [
+  // Вычисляет {top, left} для кнопки в Shorts
+  _calcShortsPos() {
+    const btnH = 36;
+
+    // 1. Ищем кнопку mute/volume внутри #shorts-player
+    const VOL = [
       '#shorts-player .ytp-mute-button',
       '#shorts-player .ytp-volume-area',
       '#shorts-player .ytp-volume-panel',
@@ -321,37 +323,47 @@ class YouTubeTranslator {
       '.ytp-mute-button',
       '.ytp-volume-area',
     ];
+    for (const sel of VOL) {
+      try {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 || r.height > 0) {
+          return {
+            top:  Math.max(0, r.top  + Math.round((r.height - btnH) / 2)),
+            left: Math.max(0, r.left - btnH - 6),
+          };
+        }
+      } catch {}
+    }
 
-    const findVolBtn = () => {
-      for (const sel of SELECTORS) {
-        try {
-          const el = document.querySelector(sel);
-          if (el) {
-            const r = el.getBoundingClientRect();
-            if (r.width > 0 || r.height > 0) return el;
-          }
-        } catch {}
+    // 2. Fallback: позиция относительно #shorts-player
+    //    Кнопка в нижней левой зоне плеера (где обычно стоят YTP-контролы)
+    const player = document.querySelector('#shorts-player');
+    if (player) {
+      const r = player.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        return {
+          top:  r.bottom - 56,   // 56px снизу плеера
+          left: r.left   + 60,   // 60px слева (правее кнопки mute)
+        };
       }
-      return null;
-    };
+    }
 
+    return null; // плеер ещё не отрендерен
+  }
+
+  _trackShortsVolumeBtn() {
     const update = () => {
       if (!this.btnEl) return;
-      const volBtn = findVolBtn();
-      if (!volBtn) return; // не найдена — остаёмся на fallback-позиции
-
-      const rect = volBtn.getBoundingClientRect();
-      const btnH = 36;
-      const top  = rect.top + Math.round((rect.height - btnH) / 2);
-      const left = rect.left - btnH - 6;
-
-      this.btnEl.style.top    = Math.max(0, top)  + 'px';
-      this.btnEl.style.left   = Math.max(0, left) + 'px';
+      const pos = this._calcShortsPos();
+      if (!pos) return;
+      this.btnEl.style.top    = pos.top  + 'px';
+      this.btnEl.style.left   = pos.left + 'px';
       this.btnEl.style.bottom = '';
       this.btnEl.style.right  = '';
     };
 
-    // Сразу + чаще чтобы поймать момент рендера
     update();
     this._btnPosTimer  = setInterval(update, 500);
     this._btnPosResize = update;
