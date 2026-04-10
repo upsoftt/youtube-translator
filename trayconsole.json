@@ -1,0 +1,22 @@
+{
+  "name": "YouTube Translator",
+  "icon": null,
+  "ownTrayIcon": false,
+  "autostart": true,
+  "openFolder": true,
+  "components": [
+    {
+      "name": null,
+      "lifecycle": {
+        "start": "pythonw trayconsole_bridge.py",
+        "stop": null,
+        "build": null
+      },
+      "pipe": "trayconsole_yttranslator_server",
+      "window": false,
+      "customActions": [
+        { "label": "Открыть веб-интерфейс", "command": "open_ui" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "name": "@youtube-translator/mobile",
+  "version": "1.0.0",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "kill-port": "node -e \"const {execSync}=require('child_process');try{const r=execSync('netstat -ano').toString().match(/:8085\\s+.*LISTENING\\s+(\\d+)/);if(r)execSync('taskkill /PID '+r[1]+' /F')}catch{}\"",
+    "prestart": "npm run kill-port",
+    "preweb": "npm run kill-port",
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web --port 8085",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "3.2.3",
+    "@expo/vector-icons": "^14.0.0",
+    "@react-native-async-storage/async-storage": "1.23.1",
+    "@react-native-community/slider": "4.5.2",
+    "css-in-js-utils": "^3.1.0",
+    "expo": "~51.0.0",
+    "expo-asset": "~10.0.10",
+    "expo-av": "~14.0.0",
+    "expo-constants": "~16.0.0",
+    "expo-font": "~12.0.7",
+    "expo-linking": "~6.3.0",
+    "expo-modules-core": "~1.12.21",
+    "expo-router": "~3.5.0",
+    "expo-secure-store": "~13.0.0",
+    "expo-status-bar": "~1.12.1",
+    "hyphenate-style-name": "^1.1.0",
+    "inline-style-prefixer": "^6.0.4",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "react-native": "0.74.5",
+    "react-native-gesture-handler": "~2.16.0",
+    "react-native-reanimated": "~3.10.0",
+    "react-native-safe-area-context": "4.10.5",
+    "react-native-screens": "3.31.1",
+    "react-native-web": "~0.19.10",
+    "socket.io-client": "^4.7.5",
+    "styleq": "^0.1.3",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/react": "~18.2.45",
+    "@types/react-native": "~0.73.0",
+    "typescript": "~5.3.3"
+  }
+}

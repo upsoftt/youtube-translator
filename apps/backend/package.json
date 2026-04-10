@@ -1,0 +1,27 @@
+{
+  "name": "@youtube-translator/backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fastify": "^4.28.0",
+    "@fastify/cors": "^9.0.1",
+    "socket.io": "^4.7.5",
+    "@deepgram/sdk": "^3.5.0",
+    "openai": "^4.55.0",
+    "edge-tts": "^1.0.1",
+    "dotenv": "^16.4.5",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "tsx": "^4.16.0",
+    "@types/node": "^20.14.0",
+    "@types/uuid": "^10.0.0"
+  }
+}

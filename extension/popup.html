@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 290px;
+      padding: 16px;
+      font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+      background: #0f0f1a;
+      color: #ddd;
+      font-size: 13px;
+    }
+
+    h3 {
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    h3 span.dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #e53e3e;
+      display: inline-block;
+    }
+
+    .field { margin-bottom: 11px; }
+
+    label {
+      display: block;
+      font-size: 11px;
+      color: #888;
+      margin-bottom: 4px;
+      letter-spacing: 0.3px;
+    }
+
+    select, input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 6px 9px;
+      border-radius: 5px;
+      border: 1px solid #2a2a40;
+      background: #16162a;
+      color: #eee;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    select:focus, input:focus {
+      border-color: #555;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .row .field { flex: 1; }
+
+    .server-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 6px;
+    }
+
+    .server-row .field { flex: 1; }
+
+    .btn-check {
+      padding: 6px 10px;
+      border-radius: 5px;
+      border: 1px solid #2a2a40;
+      background: #16162a;
+      color: #aaa;
+      cursor: pointer;
+      font-size: 12px;
+      white-space: nowrap;
+      transition: background 0.15s;
+      height: 32px;
+    }
+
+    .btn-check:hover { background: #22223a; }
+
+    .btn-save {
+      width: 100%;
+      padding: 8px;
+      border-radius: 5px;
+      border: none;
+      background: #e53e3e;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 6px;
+      transition: background 0.15s;
+    }
+
+    .btn-save:hover { background: #c53030; }
+
+    .status-bar {
+      font-size: 11px;
+      text-align: center;
+      margin-top: 9px;
+      height: 16px;
+      color: #666;
+      transition: color 0.3s;
+    }
+
+    .status-bar.ok   { color: #48bb78; }
+    .status-bar.err  { color: #fc8181; }
+
+    hr { border: none; border-top: 1px solid #1e1e30; margin: 12px 0; }
+  </style>
+</head>
+<body>
+  <h3><span class="dot"></span> YouTube Translator</h3>
+
+  <div class="field">
+    <label>Язык перевода</label>
+    <select id="lang">
+      <option value="ru">🇷🇺 Русский</option>
+      <option value="en">🇬🇧 English</option>
+      <option value="zh">🇨🇳 中文</option>
+      <option value="de">🇩🇪 Deutsch</option>
+      <option value="fr">🇫🇷 Français</option>
+      <option value="es">🇪🇸 Español</option>
+      <option value="ja">🇯🇵 日本語</option>
+      <option value="ko">🇰🇷 한국어</option>
+    </select>
+  </div>
+
+  <div class="server-row">
+    <div class="field">
+      <label>Адрес сервера</label>
+      <input type="text" id="backendUrl" placeholder="http://localhost:8211">
+    </div>
+    <button class="btn-check" id="btnCheck">Проверить</button>
+  </div>
+
+  <hr>
+
+  <div class="row">
+    <div class="field">
+      <label>OpenAI API Key</label>
+      <input type="password" id="openaiKey" placeholder="sk-…">
+    </div>
+    <div class="field">
+      <label>DeepGram Key</label>
+      <input type="password" id="deepgramKey" placeholder="…">
+    </div>
+  </div>
+
+  <button class="btn-save" id="btnSave">Сохранить</button>
+  <div class="status-bar" id="status"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

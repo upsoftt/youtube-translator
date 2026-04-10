@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build outputs
+dist/
+build/
+.expo/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.key
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+.ralph-runner/
+execution_history.md
+ralph_history.txt
+launch.json
+
+# Binaries & models
+*.exe
+*.dll
+*.pyd
+*.bin
+apps/backend/lib/
+apps/backend/models/
+apps/backend/ffmpeg.exe

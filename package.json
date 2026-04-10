@@ -1,0 +1,15 @@
+{
+  "name": "youtube-translator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Кроссплатформенное приложение для синхронного перевода YouTube-видео в реальном времени",
+  "workspaces": [
+    "apps/backend",
+    "apps/mobile"
+  ],
+  "scripts": {
+    "backend": "npm run dev --workspace=apps/backend",
+    "mobile": "npm run start --workspace=apps/mobile",
+    "install:all": "npm install"
+  }
+}
