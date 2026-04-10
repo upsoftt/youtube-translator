@@ -291,12 +291,14 @@ class YouTubeTranslator {
     btn.id    = 'ytt-btn';
     btn.title = 'YouTube Translator';
     // position:fixed — не в DOM YouTube, не конфликтует ни с чем
+    // bottom/left — начальная видимая позиция до нахождения кнопки громкости
     btn.style.cssText =
       'position:fixed;z-index:10000;pointer-events:all;' +
       'display:flex;align-items:center;justify-content:center;' +
       'width:36px;height:36px;border-radius:50%;' +
       'background:rgba(0,0,0,0.55);border:none;cursor:pointer;' +
-      'opacity:0.9;transition:opacity 0.15s;';
+      'opacity:0.9;transition:opacity 0.15s;' +
+      'bottom:80px;left:12px;';
     btn.innerHTML = this._svgLogo('idle');
     btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
     btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.9'; });
@@ -308,21 +310,27 @@ class YouTubeTranslator {
     this._trackShortsVolumeBtn();
   }
 
-  // Ищет кнопку звука в Shorts и ставит нашу кнопку слева от неё
+  // Ищет кнопку звука в Shorts и позиционирует нашу кнопку слева от неё
   _trackShortsVolumeBtn() {
     const SELECTORS = [
       '#shorts-player .ytp-mute-button',
       '#shorts-player .ytp-volume-area',
       '#shorts-player .ytp-volume-panel',
-      // Fallback: любая кнопка mute в плеере
+      '#shorts-player .ytp-left-controls .ytp-mute-button',
+      '#shorts-player .ytp-chrome-bottom .ytp-mute-button',
       '.ytp-mute-button',
       '.ytp-volume-area',
     ];
 
     const findVolBtn = () => {
       for (const sel of SELECTORS) {
-        const el = document.querySelector(sel);
-        if (el) return el;
+        try {
+          const el = document.querySelector(sel);
+          if (el) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 || r.height > 0) return el;
+          }
+        } catch {}
       }
       return null;
     };
@@ -330,20 +338,22 @@ class YouTubeTranslator {
     const update = () => {
       if (!this.btnEl) return;
       const volBtn = findVolBtn();
-      if (!volBtn) return; // ещё не появилась — ждём
+      if (!volBtn) return; // не найдена — остаёмся на fallback-позиции
 
-      const rect   = volBtn.getBoundingClientRect();
-      const btnH   = 36;
-      const top    = rect.top + Math.round((rect.height - btnH) / 2);
-      const left   = rect.left - btnH - 6; // 6px зазор
+      const rect = volBtn.getBoundingClientRect();
+      const btnH = 36;
+      const top  = rect.top + Math.round((rect.height - btnH) / 2);
+      const left = rect.left - btnH - 6;
 
-      this.btnEl.style.top   = Math.max(0, top)  + 'px';
-      this.btnEl.style.left  = Math.max(0, left) + 'px';
-      this.btnEl.style.right = '';     // убираем right если был
+      this.btnEl.style.top    = Math.max(0, top)  + 'px';
+      this.btnEl.style.left   = Math.max(0, left) + 'px';
+      this.btnEl.style.bottom = '';
+      this.btnEl.style.right  = '';
     };
 
+    // Сразу + чаще чтобы поймать момент рендера
     update();
-    this._btnPosTimer  = setInterval(update, 800);
+    this._btnPosTimer  = setInterval(update, 500);
     this._btnPosResize = update;
     window.addEventListener('resize', this._btnPosResize, { passive: true });
   }
