@@ -122,7 +122,11 @@ class YouTubeTranslator {
       const check = () => {
         const video = document.querySelector('video.html5-main-video')
                    || document.querySelector('video');
-        if (video && document.querySelector('#movie_player')) {
+        const player = this._isShorts()
+          ? (document.querySelector('#shorts-player')
+             || document.querySelector('ytd-reel-video-renderer'))
+          : document.querySelector('#movie_player');
+        if (video && player) {
           this.video = video;
           resolve();
         } else {
@@ -136,6 +140,8 @@ class YouTubeTranslator {
   // ── Inject UI ─────────────────────────────────────────────────────────────
 
   _injectUI() {
+    if (this._isShorts()) { this._injectUIShorts(); return; }
+
     const player = document.querySelector('#movie_player');
     if (!player || document.getElementById('ytt-overlay')) return;
 
@@ -210,6 +216,108 @@ class YouTubeTranslator {
         this._closePanel();
       }
     }, true);
+  }
+
+  // ── Shorts UI ─────────────────────────────────────────────────────────────
+
+  _injectUIShorts() {
+    if (document.getElementById('ytt-overlay')) return;
+
+    // Overlay и субтитры — фиксированные поверх страницы
+    const overlay = document.createElement('div');
+    overlay.id = 'ytt-overlay';
+    overlay.style.cssText =
+      'position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:9999;';
+
+    const sub = document.createElement('div');
+    sub.id = 'ytt-subtitle';
+    sub.style.cssText = `
+      position:absolute; bottom:100px; left:50%;
+      transform:translateX(-50%);
+      background:rgba(0,0,0,0.78); color:#fff;
+      font-size:18px; font-family:Arial,sans-serif; font-weight:500;
+      padding:6px 16px; border-radius:5px; max-width:80%;
+      text-align:center; line-height:1.45; display:none;
+    `;
+    overlay.appendChild(sub);
+    document.body.appendChild(overlay);
+
+    this.overlay    = overlay;
+    this.subtitleEl = sub;
+
+    // Кнопка в панели действий Shorts (правая сторона)
+    this._injectButtonShorts();
+
+    // Всплывающая панель
+    this._injectPanel(document.body, true);
+
+    // Слушатели видео
+    if (this.video) {
+      this.video.addEventListener('pause', () => {
+        if (!this.isActive) return;
+        if (this._currentAudio) this._currentAudio.pause();
+        this._stopQueueScheduler();
+      });
+      this.video.addEventListener('play', () => {
+        if (!this.isActive) return;
+        if (this._currentAudio) this._currentAudio.play().catch(() => {});
+        this._startQueueScheduler();
+      });
+      this.video.addEventListener('seeking', () => {
+        if (!this.isActive || !this.socket) return;
+        this.socket.emit('seek', { time: this.video.currentTime });
+        this._clearAudio();
+      });
+      this.video.addEventListener('ratechange', () => {
+        this._onVideoRateChange(this.video.playbackRate);
+      });
+    }
+
+    // Закрытие панели по клику вне
+    document.addEventListener('click', (e) => {
+      if (this.panelOpen &&
+          !this.panelEl?.contains(e.target) &&
+          e.target !== this.btnEl &&
+          !this.btnEl?.contains(e.target)) {
+        this._closePanel();
+      }
+    }, true);
+  }
+
+  _injectButtonShorts() {
+    const btn = document.createElement('button');
+    btn.id    = 'ytt-btn';
+    btn.title = 'YouTube Translator';
+    // Стиль под Shorts: круглая кнопка как другие действия справа
+    btn.style.cssText =
+      'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+      'width:48px;height:56px;background:none;border:none;cursor:pointer;' +
+      'color:#fff;padding:4px 0;';
+    btn.innerHTML =
+      this._svgLogo('idle') +
+      '<span style="font-size:11px;margin-top:2px;color:#fff;font-family:Roboto,Arial,sans-serif;">A/文</span>';
+    btn.addEventListener('click', (e) => { e.stopPropagation(); this._togglePanel(); });
+    this.btnEl = btn;
+
+    // Вставляем в правую панель действий Shorts
+    this._tryInsertShortsBtn(btn, 0);
+  }
+
+  _tryInsertShortsBtn(btn, attempt) {
+    if (btn.isConnected) return;
+    if (attempt > 20) return;
+
+    // Несколько вариантов селектора — YouTube регулярно меняет DOM Shorts
+    const panel = document.querySelector('ytd-shorts-action-panel-renderer #actions')
+               || document.querySelector('ytd-shorts-action-panel-renderer')
+               || document.querySelector('#shorts-inner-container #actions')
+               || document.querySelector('ytd-reel-video-renderer #actions');
+
+    if (panel) {
+      panel.insertBefore(btn, panel.firstChild);
+      if (btn.isConnected) return;
+    }
+    setTimeout(() => this._tryInsertShortsBtn(btn, attempt + 1), 300);
   }
 
   _injectButton(player) {
@@ -291,12 +399,12 @@ class YouTubeTranslator {
     </svg>`;
   }
 
-  _injectPanel(player) {
+  _injectPanel(player, isShorts = false) {
     const panel = document.createElement('div');
     panel.id = 'ytt-panel';
     panel.style.cssText = `
       display:none;
-      position:absolute; bottom:56px; right:8px;
+      ${isShorts ? 'position:fixed; bottom:80px; right:70px;' : 'position:absolute; bottom:56px; right:8px;'}
       width:280px;
       background:rgba(15,15,25,0.92);
       backdrop-filter:blur(12px);
@@ -357,6 +465,9 @@ class YouTubeTranslator {
         #ytt-toggle-switch.active { background:#e53e3e; }
         #ytt-toggle-switch.active::after { transform:translateX(20px); }
         #ytt-toggle-switch.connecting { background:#e6a800; }
+        /* Кнопка в Shorts */
+        #ytt-btn:hover svg { opacity:1; }
+        #ytt-btn svg { opacity:0.9; }
         .ytt-vol-row {
           margin-top:10px;
         }
@@ -412,7 +523,8 @@ class YouTubeTranslator {
     `;
 
     panel.addEventListener('click', e => e.stopPropagation());
-    this.overlay.appendChild(panel);
+    // В Shorts панель крепится к body (overlay position:fixed, panel position:fixed)
+    (isShorts ? document.body : this.overlay).appendChild(panel);
     this.panelEl = panel;
 
     // Ждём монтирования DOM и навешиваем обработчики
@@ -761,7 +873,14 @@ class YouTubeTranslator {
   _setStatus(state) {
     // Обновляем иконку кнопки
     if (this.btnEl) {
-      this.btnEl.innerHTML = this._svgLogo(state);
+      if (this._isShorts()) {
+        // В Shorts — SVG + подпись
+        this.btnEl.innerHTML =
+          this._svgLogo(state) +
+          '<span style="font-size:11px;margin-top:2px;color:#fff;font-family:Roboto,Arial,sans-serif;">A/文</span>';
+      } else {
+        this.btnEl.innerHTML = this._svgLogo(state);
+      }
     }
 
     // Обновляем тогл в панели
@@ -783,7 +902,15 @@ class YouTubeTranslator {
     }
   }
 
+  _isShorts() {
+    return location.pathname.startsWith('/shorts/');
+  }
+
   _getVideoId() {
+    if (this._isShorts()) {
+      const m = location.pathname.match(/\/shorts\/([^/?#]+)/);
+      return m ? m[1] : null;
+    }
     const m = location.href.match(/[?&]v=([^&]+)/);
     return m ? m[1] : null;
   }
@@ -792,7 +919,8 @@ class YouTubeTranslator {
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 function isVideoPage() {
-  return location.pathname === '/watch' && location.search.includes('v=');
+  return (location.pathname === '/watch' && location.search.includes('v='))
+      || location.pathname.startsWith('/shorts/');
 }
 
 let translator = null;
