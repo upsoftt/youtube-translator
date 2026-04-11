@@ -54,7 +54,6 @@ export async function fetchYouTubeSubtitles(
     // Ищем файл с субтитрами
     const candidates = [
       `${tmpBase}.${language}.json3`,
-      `${tmpBase}.${language}.json3`,
     ];
 
     // Также проверяем варианты с суффиксами

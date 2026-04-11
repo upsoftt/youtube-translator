@@ -70,66 +70,8 @@ export class GenderDetector {
     return this.lastGender;
   }
 
-  /**
-   * Определяет пол по PCM-данным через автокорреляцию pitch.
-   */
   private detectGender(pcmData: Buffer): SpeakerGender {
-    const sampleRate = 16000;
-    const samples = new Float32Array(pcmData.buffer, pcmData.byteOffset, pcmData.byteLength / 4);
-
-    // Берём 1 секунду из середины
-    const start = Math.floor(Math.max(0, (samples.length - sampleRate) / 2));
-    const end = Math.min(samples.length, start + sampleRate);
-    const segment = samples.slice(start, end);
-
-    if (segment.length < 1600) return this.lastGender; // мало данных — оставляем предыдущий
-
-    const minLag = Math.floor(sampleRate / 300); // 300Hz max
-    const maxLag = Math.floor(sampleRate / 75);  // 75Hz min
-
-    const windowSize = Math.floor(sampleRate * 0.03); // 30ms
-    const numWindows = Math.floor(segment.length / windowSize) - 1;
-    const pitches: number[] = [];
-
-    for (let w = 0; w < Math.min(numWindows, 20); w++) {
-      const wStart = w * windowSize;
-      let bestWCorr = -1;
-      let bestWLag = 0;
-
-      for (let lag = minLag; lag <= maxLag && wStart + lag + windowSize < segment.length; lag++) {
-        let corr = 0;
-        let energy1 = 0;
-        let energy2 = 0;
-
-        for (let i = 0; i < windowSize; i++) {
-          corr += segment[wStart + i] * segment[wStart + i + lag];
-          energy1 += segment[wStart + i] * segment[wStart + i];
-          energy2 += segment[wStart + i + lag] * segment[wStart + i + lag];
-        }
-
-        const norm = Math.sqrt(energy1 * energy2);
-        if (norm > 0.001) {
-          const normalizedCorr = corr / norm;
-          if (normalizedCorr > bestWCorr) {
-            bestWCorr = normalizedCorr;
-            bestWLag = lag;
-          }
-        }
-      }
-
-      if (bestWCorr > 0.5 && bestWLag > 0) {
-        pitches.push(sampleRate / bestWLag);
-      }
-    }
-
-    if (pitches.length < 3) return this.lastGender;
-
-    pitches.sort((a, b) => a - b);
-    const medianPitch = pitches[Math.floor(pitches.length / 2)];
-
-    const gender: SpeakerGender = medianPitch < 165 ? 'male' : 'female';
-    console.log(`[GenderDetector] Pitch: ${medianPitch.toFixed(0)}Hz → ${gender}`);
-    return gender;
+    return detectGenderFromPCM(pcmData, this.lastGender);
   }
 
   /**
@@ -146,4 +88,70 @@ export class GenderDetector {
     this.pcmBuffer = [];
     this.pcmBufferSize = 0;
   }
+}
+
+/**
+ * Определяет пол говорящего по PCM-данным через автокорреляцию pitch.
+ * PCM формат: float32le, 16kHz, mono.
+ * Мужской голос: < 165 Hz, женский: >= 165 Hz.
+ *
+ * @param pcmData - буфер PCM f32le 16kHz mono
+ * @param fallback - значение по умолчанию при недостатке данных
+ */
+export function detectGenderFromPCM(pcmData: Buffer, fallback: SpeakerGender = 'unknown'): SpeakerGender {
+  const sampleRate = 16000;
+  const samples = new Float32Array(pcmData.buffer, pcmData.byteOffset, pcmData.byteLength / 4);
+
+  // Берём 1 секунду из середины
+  const start = Math.floor(Math.max(0, (samples.length - sampleRate) / 2));
+  const end = Math.min(samples.length, start + sampleRate);
+  const segment = samples.slice(start, end);
+
+  if (segment.length < 1600) return fallback;
+
+  const minLag = Math.floor(sampleRate / 300); // 300Hz max
+  const maxLag = Math.floor(sampleRate / 75);  // 75Hz min
+  const windowSize = Math.floor(sampleRate * 0.03); // 30ms
+  const numWindows = Math.floor(segment.length / windowSize) - 1;
+  const pitches: number[] = [];
+
+  for (let w = 0; w < Math.min(numWindows, 20); w++) {
+    const wStart = w * windowSize;
+    let bestWCorr = -1;
+    let bestWLag = 0;
+
+    for (let lag = minLag; lag <= maxLag && wStart + lag + windowSize < segment.length; lag++) {
+      let corr = 0;
+      let energy1 = 0;
+      let energy2 = 0;
+
+      for (let i = 0; i < windowSize; i++) {
+        corr += segment[wStart + i] * segment[wStart + i + lag];
+        energy1 += segment[wStart + i] * segment[wStart + i];
+        energy2 += segment[wStart + i + lag] * segment[wStart + i + lag];
+      }
+
+      const norm = Math.sqrt(energy1 * energy2);
+      if (norm > 0.001) {
+        const normalizedCorr = corr / norm;
+        if (normalizedCorr > bestWCorr) {
+          bestWCorr = normalizedCorr;
+          bestWLag = lag;
+        }
+      }
+    }
+
+    if (bestWCorr > 0.5 && bestWLag > 0) {
+      pitches.push(sampleRate / bestWLag);
+    }
+  }
+
+  if (pitches.length < 3) return fallback;
+
+  pitches.sort((a, b) => a - b);
+  const medianPitch = pitches[Math.floor(pitches.length / 2)];
+
+  const gender: SpeakerGender = medianPitch < 165 ? 'male' : 'female';
+  console.log(`[GenderDetector] Pitch: ${medianPitch.toFixed(0)}Hz → ${gender}`);
+  return gender;
 }

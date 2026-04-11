@@ -84,6 +84,9 @@ class YouTubeTranslator {
     this._btnPosObs      = null;
     this._btnPosTimer    = null;
     this._btnPosResize   = null;
+    this._btnInsertTimer = null;
+    this._ttsProviders   = null;   // кеш метаданных провайдеров с бэкенда
+    this.spinnerEl       = null;
   }
 
   async init() {
@@ -100,14 +103,42 @@ class YouTubeTranslator {
   async _loadSettings() {
     return new Promise(resolve => {
       chrome.storage.sync.get({
-        targetLanguage: 'ru',
-        backendUrl:     'http://localhost:8211',
-        openaiApiKey:   '',
-        deepgramApiKey: '',
-        origVolume:     0.1,
-        transVolume:    1.0,
+        targetLanguage:    'ru',
+        backendUrl:        'http://localhost:8211',
+        openaiApiKey:      '',
+        deepgramApiKey:    '',
+        origVolume:        0.1,
+        transVolume:       1.0,
+        ttsProvider:       'edge-tts',
+        ttsProviderConfig: '{}',   // JSON-строка Record<string,string>
+        voiceClone:        false,
       }, resolve);
     });
+  }
+
+  /** Загружает список TTS-провайдеров с бэкенда (HTTP GET /api/tts-providers) */
+  async _loadTTSProviders() {
+    try {
+      const url = (this.settings.backendUrl || 'http://localhost:8211') + '/api/tts-providers';
+      const res  = await fetch(url, { signal: AbortSignal.timeout(4000) });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.providers || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Тестирует соединение с выбранным TTS-провайдером */
+  async _testTTSProvider(providerId, cfg) {
+    const url = (this.settings.backendUrl || 'http://localhost:8211') + '/api/test-tts';
+    const res  = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ providerId, config: cfg }),
+      signal:  AbortSignal.timeout(8000),
+    });
+    return res.json();
   }
 
   _saveVolumes() {
@@ -166,11 +197,42 @@ class YouTubeTranslator {
       text-shadow:0 1px 3px rgba(0,0,0,0.8);
     `;
 
+    // Спиннер-индикатор стадии обработки
+    const spinner = document.createElement('div');
+    spinner.id = 'ytt-spinner';
+    spinner.style.cssText = `
+      position:absolute; bottom:80px; left:50%;
+      transform:translateX(-50%);
+      background:rgba(0,0,0,0.82); color:#fff;
+      font-size:15px; font-family:Arial,sans-serif; font-weight:500;
+      padding:8px 22px; border-radius:8px;
+      display:none; align-items:center; gap:10px;
+      text-shadow:0 1px 3px rgba(0,0,0,0.8);
+      z-index:2001;
+    `;
+    spinner.innerHTML = `
+      <svg width="18" height="18" viewBox="0 0 24 24" style="animation:ytt-spin 0.8s linear infinite;flex-shrink:0">
+        <circle cx="12" cy="12" r="10" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="3"/>
+        <path d="M12 2a10 10 0 0 1 10 10" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+      <span id="ytt-spinner-text">Подключение…</span>
+    `;
+
+    // CSS-анимация спиннера
+    if (!document.getElementById('ytt-spinner-style')) {
+      const style = document.createElement('style');
+      style.id = 'ytt-spinner-style';
+      style.textContent = '@keyframes ytt-spin{to{transform:rotate(360deg)}}';
+      document.head.appendChild(style);
+    }
+
     overlay.appendChild(sub);
+    overlay.appendChild(spinner);
     player.appendChild(overlay);
 
     this.overlay    = overlay;
     this.subtitleEl = sub;
+    this.spinnerEl  = spinner;
 
     // Кнопка — вставляем в правую часть controls bar YouTube
     this._injectButton(player);
@@ -241,11 +303,33 @@ class YouTubeTranslator {
       padding:6px 16px; border-radius:5px; max-width:80%;
       text-align:center; line-height:1.45; display:none;
     `;
+    // Спиннер-индикатор стадии обработки (Shorts)
+    const spinner = document.createElement('div');
+    spinner.id = 'ytt-spinner';
+    spinner.style.cssText = `
+      position:absolute; bottom:100px; left:50%;
+      transform:translateX(-50%);
+      background:rgba(0,0,0,0.82); color:#fff;
+      font-size:14px; font-family:Arial,sans-serif; font-weight:500;
+      padding:7px 18px; border-radius:8px;
+      display:none; align-items:center; gap:10px;
+      z-index:2001;
+    `;
+    spinner.innerHTML = `
+      <svg width="16" height="16" viewBox="0 0 24 24" style="animation:ytt-spin 0.8s linear infinite;flex-shrink:0">
+        <circle cx="12" cy="12" r="10" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="3"/>
+        <path d="M12 2a10 10 0 0 1 10 10" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+      <span id="ytt-spinner-text">Подключение…</span>
+    `;
+
     overlay.appendChild(sub);
+    overlay.appendChild(spinner);
     document.body.appendChild(overlay);
 
     this.overlay    = overlay;
     this.subtitleEl = sub;
+    this.spinnerEl  = spinner;
 
     // Кнопка в панели действий Shorts (правая сторона)
     this._injectButtonShorts();
@@ -287,87 +371,74 @@ class YouTubeTranslator {
   }
 
   _injectButtonShorts() {
+    // Пробуем вставить сразу; если DOM плеера ещё не готов — повторяем раз в 300 мс
+    if (!this._insertBtnBetweenControls()) {
+      this._btnInsertTimer = setInterval(() => {
+        if (this._insertBtnBetweenControls()) {
+          clearInterval(this._btnInsertTimer);
+          this._btnInsertTimer = null;
+          this._watchBtnPresence();
+        }
+      }, 300);
+    } else {
+      this._watchBtnPresence();
+    }
+  }
+
+  // Создаёт нашу кнопку и вставляет её прямо в DOM плеера между play и mute.
+  // Возвращает true при успехе.
+  _insertBtnBetweenControls() {
+    const player = document.querySelector('#shorts-player');
+    if (!player) return false;
+
+    // Кнопка play — якорь для вставки
+    const playBtn = player.querySelector('.ytp-play-button');
+    if (!playBtn || !playBtn.parentNode) return false;
+
+    // Не дублируем
+    if (document.getElementById('ytt-btn')) return true;
+
     const btn = document.createElement('button');
     btn.id    = 'ytt-btn';
     btn.title = 'YouTube Translator';
-    // position:fixed — не в DOM YouTube, не конфликтует ни с чем
+    // Стиль под нативные кнопки YT Shorts: round, same dark-bg, inline-flex
     btn.style.cssText =
-      'position:fixed;z-index:10000;pointer-events:all;' +
-      'display:flex;align-items:center;justify-content:center;' +
-      'width:36px;height:36px;border-radius:50%;' +
-      'background:rgba(0,0,0,0.55);border:none;cursor:pointer;' +
-      'opacity:0.9;transition:opacity 0.15s;' +
-      'top:-200px;left:-200px;'; // скрыта до нахождения позиции
+      'display:inline-flex;align-items:center;justify-content:center;' +
+      'width:48px;height:48px;min-width:48px;border-radius:50%;padding:0;' +
+      'background:rgba(0,0,0,0.5);border:none;cursor:pointer;vertical-align:middle;' +
+      'opacity:0.95;transition:opacity 0.15s,transform 0.15s;flex-shrink:0;' +
+      'margin:0 2px;';
     btn.innerHTML = this._svgLogo('idle');
-    btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
-    btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.9'; });
-    btn.addEventListener('click', (e) => { e.stopPropagation(); this._togglePanel(); });
+    btn.addEventListener('mouseenter', () => { btn.style.opacity='1'; btn.style.transform='scale(1.1)'; });
+    btn.addEventListener('mouseleave', () => { btn.style.opacity='0.95'; btn.style.transform='scale(1)'; });
+    btn.addEventListener('click', e => { e.stopPropagation(); this._togglePanel(); });
     this.btnEl = btn;
-    document.body.appendChild(btn);
 
-    // Позиционируем слева от кнопки звука — обновляем при каждом изменении
-    this._trackShortsVolumeBtn();
-  }
-
-  // Вычисляет {top, left} для кнопки в Shorts
-  _calcShortsPos() {
-    const btnH = 36;
-
-    // 1. Ищем кнопку mute/volume внутри #shorts-player
-    const VOL = [
-      '#shorts-player .ytp-mute-button',
-      '#shorts-player .ytp-volume-area',
-      '#shorts-player .ytp-volume-panel',
-      '#shorts-player .ytp-left-controls .ytp-mute-button',
-      '#shorts-player .ytp-chrome-bottom .ytp-mute-button',
-      '.ytp-mute-button',
-      '.ytp-volume-area',
-    ];
-    for (const sel of VOL) {
-      try {
-        const el = document.querySelector(sel);
-        if (!el) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 || r.height > 0) {
-          return {
-            top:  Math.max(0, r.top  + Math.round((r.height - btnH) / 2)),
-            left: Math.max(0, r.left - btnH - 6),
-          };
-        }
-      } catch {}
+    // Вставляем после play, перед mute (если mute в том же контейнере)
+    const muteBtn = playBtn.parentNode.querySelector('.ytp-mute-button');
+    if (muteBtn && muteBtn !== playBtn.nextSibling) {
+      playBtn.parentNode.insertBefore(btn, muteBtn);
+    } else {
+      playBtn.insertAdjacentElement('afterend', btn);
     }
 
-    // 2. Fallback: позиция относительно #shorts-player
-    //    Кнопка в нижней левой зоне плеера (где обычно стоят YTP-контролы)
-    const player = document.querySelector('#shorts-player');
-    if (player) {
-      const r = player.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0) {
-        return {
-          top:  r.bottom - 56,   // 56px снизу плеера
-          left: r.left   + 60,   // 60px слева (правее кнопки mute)
-        };
+    return true;
+  }
+
+  // Следит, что наша кнопка не исчезла из DOM (YT может перестраивать controls).
+  // Если пропала — вставляет снова.
+  _watchBtnPresence() {
+    this._btnPosTimer = setInterval(() => {
+      const existing = document.getElementById('ytt-btn');
+      if (!existing) {
+        // Кнопку выбросило — пересоздаём
+        this.btnEl = null;
+        this._insertBtnBetweenControls();
+      } else {
+        // Синхронизируем ссылку
+        this.btnEl = existing;
       }
-    }
-
-    return null; // плеер ещё не отрендерен
-  }
-
-  _trackShortsVolumeBtn() {
-    const update = () => {
-      if (!this.btnEl) return;
-      const pos = this._calcShortsPos();
-      if (!pos) return;
-      this.btnEl.style.top    = pos.top  + 'px';
-      this.btnEl.style.left   = pos.left + 'px';
-      this.btnEl.style.bottom = '';
-      this.btnEl.style.right  = '';
-    };
-
-    update();
-    this._btnPosTimer  = setInterval(update, 500);
-    this._btnPosResize = update;
-    window.addEventListener('resize', this._btnPosResize, { passive: true });
+    }, 1000);
   }
 
   _injectButton(player) {
@@ -423,9 +494,10 @@ class YouTubeTranslator {
   }
 
   _stopBtnTracking() {
-    if (this._btnPosObs)    { this._btnPosObs.disconnect(); this._btnPosObs = null; }
-    if (this._btnPosTimer)  { clearInterval(this._btnPosTimer); this._btnPosTimer = null; }
-    if (this._btnPosResize) {
+    if (this._btnPosObs)     { this._btnPosObs.disconnect(); this._btnPosObs = null; }
+    if (this._btnPosTimer)   { clearInterval(this._btnPosTimer); this._btnPosTimer = null; }
+    if (this._btnInsertTimer){ clearInterval(this._btnInsertTimer); this._btnInsertTimer = null; }
+    if (this._btnPosResize)  {
       window.removeEventListener('resize', this._btnPosResize);
       this._btnPosResize = null;
     }
@@ -440,7 +512,7 @@ class YouTubeTranslator {
     const textColorL    = isActive ? '#fff' : 'white';
     const textColorR    = isActive ? '#fff' : (isConnecting ? '#e6a800' : '#aad4ff');
 
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -1 54 44" width="30" height="26">
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -1 54 44" width="38" height="33" style="margin-top:5px">
       <!-- Правый пузырь (за левым), хвост вправо-вниз -->
       <path d="M18,11 H40 Q44,11 44,15 V26 Q44,30 40,30 H34 L40,36 L36,30 H18 Q14,30 14,26 V15 Q14,11 18,11 Z"
             fill="${fillBubble}" stroke="${strokeR}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
@@ -536,6 +608,18 @@ class YouTubeTranslator {
           display:block; color:rgba(255,255,255,0.6); font-size:11px;
           margin-bottom:5px;
         }
+        #ytt-tts-fields input[type=text],
+        #ytt-tts-fields input[type=password] {
+          width:100%; box-sizing:border-box; padding:5px 8px; border-radius:6px;
+          border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.07);
+          color:#e8e8e8; font-size:12px; outline:none;
+        }
+        #ytt-tts-fields input:focus {
+          border-color:rgba(79,195,247,0.5);
+        }
+        #ytt-tts-test { transition:background 0.15s; }
+        #ytt-tts-test:hover { background:rgba(255,255,255,0.1) !important; }
+        #ytt-tts-test:disabled { opacity:0.5; cursor:not-allowed; }
       `;
       document.head.appendChild(style);
     }
@@ -555,7 +639,33 @@ class YouTubeTranslator {
         </select>
       </div>
 
-      <div class="ytt-vol-row">
+      <div class="ytt-lang-row" style="margin-bottom:0;">
+        <label>Синтез речи (TTS)</label>
+        <select id="ytt-tts-select">
+          <option value="edge-tts">Edge TTS (бесплатный)</option>
+        </select>
+        <div id="ytt-tts-desc" style="margin-top:4px;font-size:11px;color:rgba(255,255,255,0.45);line-height:1.4;"></div>
+      </div>
+
+      <div id="ytt-tts-fields" style="margin-top:8px;"></div>
+
+      <div id="ytt-voice-clone-row" style="display:none;margin-top:8px;align-items:center;gap:8px;">
+        <input type="checkbox" id="ytt-voice-clone" style="width:16px;height:16px;cursor:pointer;">
+        <label for="ytt-voice-clone" style="font-size:12px;color:rgba(255,255,255,0.75);cursor:pointer;margin:0;">
+          Клонировать голос из видео
+        </label>
+      </div>
+
+      <div id="ytt-tts-test-row" style="margin-top:8px;display:none;">
+        <button id="ytt-tts-test"
+          style="width:100%;padding:5px 0;border-radius:6px;border:1px solid rgba(255,255,255,0.2);
+                 background:rgba(255,255,255,0.06);color:#e8e8e8;font-size:12px;cursor:pointer;">
+          Проверить соединение
+        </button>
+        <div id="ytt-tts-test-result" style="margin-top:4px;font-size:11px;text-align:center;min-height:14px;"></div>
+      </div>
+
+      <div class="ytt-vol-row" style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.08);">
         <div class="ytt-vol-label">
           Громкость оригинала <span id="ytt-orig-val">${Math.round(this._origVolume * 100)}%</span>
         </div>
@@ -590,13 +700,11 @@ class YouTubeTranslator {
     const p = this.panelEl;
     if (!p) return;
 
-    // Тогл вкл/выкл
+    // ── Тогл вкл/выкл ──────────────────────────────────────────────────────
     const toggleBtn = p.querySelector('#ytt-toggle-switch');
-    if (toggleBtn) {
-      toggleBtn.addEventListener('click', () => this._toggle());
-    }
+    if (toggleBtn) toggleBtn.addEventListener('click', () => this._toggle());
 
-    // Громкость оригинала
+    // ── Громкость оригинала ─────────────────────────────────────────────────
     const origSlider = p.querySelector('#ytt-orig-vol');
     const origVal    = p.querySelector('#ytt-orig-val');
     if (origSlider) {
@@ -610,7 +718,7 @@ class YouTubeTranslator {
       });
     }
 
-    // Громкость перевода
+    // ── Громкость перевода ──────────────────────────────────────────────────
     const transSlider = p.querySelector('#ytt-trans-vol');
     const transVal    = p.querySelector('#ytt-trans-val');
     if (transSlider) {
@@ -624,19 +732,228 @@ class YouTubeTranslator {
       });
     }
 
-    // Язык
+    // ── Язык перевода ───────────────────────────────────────────────────────
     const langSelect = p.querySelector('#ytt-lang-select');
     if (langSelect) {
       langSelect.value = this.settings.targetLanguage || 'ru';
       langSelect.addEventListener('change', () => {
         this.settings.targetLanguage = langSelect.value;
         chrome.storage.sync.set({ targetLanguage: langSelect.value });
-        // Если перевод активен — перезапускаем с новым языком
         if (this.isActive) {
           this._stopTranslation();
           setTimeout(() => this._startTranslation(), 300);
         }
       });
+    }
+
+    // ── TTS провайдер ───────────────────────────────────────────────────────
+    this._initTTSPanel(p);
+  }
+
+  /** Загружает список провайдеров с бэкенда и строит TTS-секцию панели */
+  async _initTTSPanel(p) {
+    const ttsSelect      = p.querySelector('#ytt-tts-select');
+    const ttsFields      = p.querySelector('#ytt-tts-fields');
+    const ttsDesc        = p.querySelector('#ytt-tts-desc');
+    const testRow        = p.querySelector('#ytt-tts-test-row');
+    const testBtn        = p.querySelector('#ytt-tts-test');
+    const testResult     = p.querySelector('#ytt-tts-test-result');
+    const cloneRow       = p.querySelector('#ytt-voice-clone-row');
+    const cloneCheck     = p.querySelector('#ytt-voice-clone');
+    if (!ttsSelect) return;
+
+    // Загружаем провайдеры с бэкенда
+    const providers = await this._loadTTSProviders();
+    this._ttsProviders = providers; // кешируем
+
+    if (providers && providers.length > 0) {
+      ttsSelect.innerHTML = providers.map(pr =>
+        `<option value="${pr.id}">${pr.name}</option>`
+      ).join('');
+    }
+
+    // Восстанавливаем сохранённый выбор
+    const savedProvider = this.settings.ttsProvider || 'edge-tts';
+    ttsSelect.value = savedProvider;
+
+    // Рендерим поля под выбранный провайдер
+    const renderProvider = (providerId) => {
+      const meta = (this._ttsProviders || []).find(pr => pr.id === providerId);
+      if (!meta) { ttsDesc.textContent = ''; ttsFields.innerHTML = ''; return; }
+
+      ttsDesc.textContent = meta.description || '';
+
+      // Показываем / скрываем строку "Клонировать голос"
+      cloneRow.style.display = meta.supportsVoiceClone ? 'flex' : 'none';
+
+      // Показываем / скрываем кнопку "Проверить" (не нужна для edge-tts)
+      testRow.style.display = meta.fields.length > 0 || meta.id === 'cosyvoice' ? 'block' : 'none';
+
+      // Рендерим поля (apiKey, serverUrl, …)
+      let savedCfg = {};
+      try { savedCfg = JSON.parse(this.settings.ttsProviderConfig || '{}'); } catch {}
+
+      ttsFields.innerHTML = meta.fields.map(f => {
+        if (f.type === 'select') {
+          const saved = savedCfg[f.key] || '';
+          return `
+            <div style="margin-bottom:8px;">
+              <div style="font-size:11px;color:rgba(255,255,255,0.55);margin-bottom:4px;">${f.label}</div>
+              <select
+                id="ytt-tts-field-${f.key}"
+                style="width:100%;box-sizing:border-box;padding:5px 8px;border-radius:6px;
+                       border:1px solid rgba(255,255,255,0.15);background:rgba(15,15,25,0.95);
+                       color:#e8e8e8;font-size:12px;outline:none;"
+              >
+                <option value="">${f.placeholder || 'Выберите…'}</option>
+                ${saved ? `<option value="${saved}" selected>${saved}</option>` : ''}
+              </select>
+            </div>
+          `;
+        }
+        return `
+          <div style="margin-bottom:8px;">
+            <div style="font-size:11px;color:rgba(255,255,255,0.55);margin-bottom:4px;">${f.label}</div>
+            <input
+              id="ytt-tts-field-${f.key}"
+              type="${f.type === 'password' ? 'password' : 'text'}"
+              placeholder="${f.placeholder || ''}"
+              value="${(savedCfg[f.key] || '').replace(/"/g, '&quot;')}"
+              style="width:100%;box-sizing:border-box;padding:5px 8px;border-radius:6px;
+                     border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.07);
+                     color:#e8e8e8;font-size:12px;outline:none;"
+            >
+          </div>
+        `;
+      }).join('');
+
+      // Навешиваем сохранение при изменении полей
+      meta.fields.forEach(f => {
+        const el = ttsFields.querySelector(`#ytt-tts-field-${f.key}`);
+        if (!el) return;
+        el.addEventListener(f.type === 'select' ? 'change' : 'input', () => this._saveTTSConfig(providerId));
+      });
+
+      // Загружаем опции для select-полей
+      meta.fields.filter(f => f.type === 'select' && f.optionsUrl).forEach(f => {
+        this._loadSelectOptions(f, providerId, savedCfg);
+      });
+    };
+
+    renderProvider(savedProvider);
+
+    // При смене провайдера
+    ttsSelect.addEventListener('change', () => {
+      const id = ttsSelect.value;
+      this.settings.ttsProvider = id;
+      chrome.storage.sync.set({ ttsProvider: id });
+      renderProvider(id);
+      testResult.textContent = '';
+      if (this.isActive) {
+        this._stopTranslation();
+        setTimeout(() => this._startTranslation(), 300);
+      }
+    });
+
+    // Чекбокс клонирования голоса
+    if (cloneCheck) {
+      cloneCheck.checked = !!this.settings.voiceClone;
+      cloneCheck.addEventListener('change', () => {
+        this.settings.voiceClone = cloneCheck.checked;
+        chrome.storage.sync.set({ voiceClone: cloneCheck.checked });
+      });
+    }
+
+    // Кнопка "Проверить соединение"
+    if (testBtn) {
+      testBtn.addEventListener('click', async () => {
+        const providerId = ttsSelect.value;
+        const cfg = this._readTTSFields(providerId);
+        testBtn.disabled = true;
+        testResult.style.color = 'rgba(255,255,255,0.5)';
+        testResult.textContent = 'Проверяю…';
+        try {
+          const res = await this._testTTSProvider(providerId, cfg);
+          testResult.style.color = res.ok ? '#4ade80' : '#f87171';
+          testResult.textContent  = res.ok ? `✓ ${res.message}` : `✗ ${res.message}`;
+        } catch (e) {
+          testResult.style.color = '#f87171';
+          testResult.textContent = `✗ Нет связи с бэкендом`;
+        }
+        testBtn.disabled = false;
+      });
+    }
+  }
+
+  /** Читает текущие значения полей TTS из DOM */
+  _readTTSFields(providerId) {
+    const cfg = {};
+    const meta = (this._ttsProviders || []).find(pr => pr.id === providerId);
+    if (!meta) return cfg;
+    meta.fields.forEach(f => {
+      const input = this.panelEl?.querySelector(`#ytt-tts-field-${f.key}`);
+      if (input) cfg[f.key] = input.value.trim();
+    });
+    return cfg;
+  }
+
+  /** Сохраняет конфигурацию TTS-провайдера в chrome.storage */
+  _saveTTSConfig(providerId) {
+    const cfg = this._readTTSFields(providerId);
+    this.settings.ttsProviderConfig = JSON.stringify(cfg);
+    chrome.storage.sync.set({ ttsProviderConfig: JSON.stringify(cfg) });
+  }
+
+  /** Загружает опции для select-поля с бэкенда */
+  async _loadSelectOptions(fieldDef, providerId, savedCfg) {
+    const selectEl = this.panelEl?.querySelector(`#ytt-tts-field-${fieldDef.key}`);
+    if (!selectEl) return;
+
+    // Получаем API key из соседнего поля
+    const apiKeyField = fieldDef.optionsApiKeyField;
+    const apiKey = apiKeyField
+      ? (this.panelEl?.querySelector(`#ytt-tts-field-${apiKeyField}`)?.value || savedCfg[apiKeyField] || '')
+      : '';
+
+    if (!apiKey) {
+      selectEl.innerHTML = '<option value="">Сначала введите API ключ</option>';
+      // Перезагружаем опции когда введут ключ
+      const keyInput = this.panelEl?.querySelector(`#ytt-tts-field-${apiKeyField}`);
+      if (keyInput) {
+        const handler = () => {
+          keyInput.removeEventListener('change', handler);
+          keyInput.removeEventListener('blur', handler);
+          this._loadSelectOptions(fieldDef, providerId, this._readTTSFields(providerId));
+        };
+        keyInput.addEventListener('change', handler);
+        keyInput.addEventListener('blur', handler);
+      }
+      return;
+    }
+
+    selectEl.innerHTML = '<option value="">Загрузка…</option>';
+    selectEl.disabled = true;
+
+    try {
+      const url = (this.settings.backendUrl || 'http://localhost:8211') + fieldDef.optionsUrl;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey }),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const options = await res.json();
+
+      const savedValue = savedCfg[fieldDef.key] || '';
+      selectEl.innerHTML = '<option value="">Выберите голос…</option>' +
+        options.map(o => `<option value="${o.value}" ${o.value === savedValue ? 'selected' : ''}>${o.label}</option>`).join('');
+    } catch (e) {
+      selectEl.innerHTML = '<option value="">Ошибка загрузки</option>';
+      console.error('[YTT] Ошибка загрузки опций:', e);
+    } finally {
+      selectEl.disabled = false;
     }
   }
 
@@ -653,13 +970,13 @@ class YouTubeTranslator {
     this.panelEl.style.display = 'block';
     this.panelOpen = true;
 
-    // В Shorts панель position:fixed — позиционируем рядом с кнопкой
+    // В Shorts панель position:fixed — позиционируем под кнопкой
     if (this._isShorts() && this.btnEl) {
       const r = this.btnEl.getBoundingClientRect();
       this.panelEl.style.bottom = '';
-      this.panelEl.style.top    = Math.max(4, r.bottom - 280) + 'px';
+      this.panelEl.style.top    = Math.round(r.bottom + 8) + 'px';
       this.panelEl.style.right  = '';
-      this.panelEl.style.left   = Math.max(4, r.left - 288) + 'px'; // 280 + 8gap
+      this.panelEl.style.left   = Math.max(4, r.left) + 'px';
     }
 
     // Обновляем значения слайдеров на случай если изменились
@@ -732,13 +1049,26 @@ class YouTubeTranslator {
     });
 
     socket.on('segment',      (s) => this._handleSegment(s));
-    socket.on('pause_video',  ()  => this.video?.pause());
+    socket.on('pause_video',  ()  => {
+      this.video?.pause();
+      this._showSpinner('Подготовка…');
+    });
     socket.on('resume_video', ()  => {
       this.video?.play().catch(() => {});
       this._setStatus('active');
+      this._hideSpinner();
       this._startQueueScheduler();
     });
-    socket.on('error',        (d) => console.error('[YTT] Server error:', d.message));
+    socket.on('status',       (d) => {
+      // Показываем спиннер только пока видео на паузе (ожидание первого сегмента)
+      if (this.video && this.video.paused) {
+        this._showSpinner(d.message);
+      }
+    });
+    socket.on('error',        (d) => {
+      console.error('[YTT] Server error:', d.message);
+      this._hideSpinner();
+    });
     socket.on('disconnect',   ()  => {
       if (this.isActive) { this.isActive = false; this._setStatus('idle'); }
     });
@@ -747,13 +1077,18 @@ class YouTubeTranslator {
     this.isActive = true;
 
     const currentTime = this.video?.currentTime ?? 0;
+    let ttsProviderConfig = {};
+    try { ttsProviderConfig = JSON.parse(this.settings.ttsProviderConfig || '{}'); } catch {}
+
     this._pendingStart = {
       videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
       settings: {
-        targetLanguage:      this.settings.targetLanguage || 'ru',
+        targetLanguage:      this.settings.targetLanguage    || 'ru',
         sttProvider:         'deepgram',
         translationProvider: 'openai',
-        ttsProvider:         'deepgram-tts',
+        ttsProvider:         this.settings.ttsProvider       || 'edge-tts',
+        ttsProviderConfig,
+        voiceClone:          !!this.settings.voiceClone,
         translationMode:     'streaming',
         preferSubtitles:     true,
         seekTime:            currentTime > 1 ? currentTime : undefined,
@@ -856,13 +1191,13 @@ class YouTubeTranslator {
     const videoTime  = this.video?.currentTime ?? 0;
     const drift      = videoTime - segment.startTime; // > 0 → мы опаздываем
 
-    // Rate-fitting с учётом дрейфа:
-    // если играем с опозданием — окно для аудио уменьшается
+    // Rate-fitting: ускоряем максимум до 1.4x — лучше запоздать, чем трещотка
     let rate = videoRate;
     if (segment.audioDuration > 0 && segment.duration > 0) {
-      const effectiveDuration = Math.max(0.5, segment.duration - Math.max(0, drift));
+      // Не сжимаем окно ниже 70% от исходной длительности сегмента
+      const effectiveDuration = Math.max(segment.duration * 0.7, segment.duration - Math.max(0, drift));
       rate = (segment.audioDuration / effectiveDuration) * videoRate;
-      rate = Math.min(2.5, Math.max(videoRate, rate));
+      rate = Math.min(1.4, Math.max(videoRate, rate));
     }
 
     this.isPlayingAudio  = true;
@@ -876,12 +1211,19 @@ class YouTubeTranslator {
       this._currentAudio = audio;
 
       await new Promise(r => {
-        audio.onended = () => r();
-        audio.onerror = () => r();
+        let syncInterval = null;
+        const cleanup = () => {
+          if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
+          r();
+        };
+
+        audio.onended = cleanup;
+        audio.onerror = cleanup;
 
         // Полинг каждые 80мс: синхронизируем паузу TTS с паузой видео
-        const syncInterval = setInterval(() => {
-          if (!this._currentAudio) { clearInterval(syncInterval); r(); return; }
+        syncInterval = setInterval(() => {
+          // Если аудио уже не текущее — очищаемся
+          if (this._currentAudio !== audio) { cleanup(); return; }
           const videoPaused = this.video?.paused ?? false;
           if (videoPaused && !audio.paused) {
             audio.pause();
@@ -890,7 +1232,7 @@ class YouTubeTranslator {
           }
         }, 80);
 
-        audio.play().catch(() => { clearInterval(syncInterval); r(); });
+        audio.play().catch(() => cleanup());
       });
     } catch (e) {
       console.error('[YTT] Audio error:', e);
@@ -925,6 +1267,24 @@ class YouTubeTranslator {
     this._currentSegment = null;
   }
 
+  // ── Spinner (стадии обработки) ────────────────────────────────────────────
+
+  _showSpinner(text) {
+    if (!this.spinnerEl) return;
+    // Если перевод уже активен — не показываем спиннер для промежуточных статусов
+    // (кроме seek, когда firstSegmentSent сбрасывается через pause_video)
+    const label = this.spinnerEl.querySelector('#ytt-spinner-text');
+    if (label) label.textContent = text || 'Обработка…';
+    this.spinnerEl.style.display = 'flex';
+    // Прячем субтитры пока виден спиннер
+    if (this.subtitleEl) this.subtitleEl.style.display = 'none';
+  }
+
+  _hideSpinner() {
+    if (!this.spinnerEl) return;
+    this.spinnerEl.style.display = 'none';
+  }
+
   // ── UI helpers ────────────────────────────────────────────────────────────
 
   _setSubtitle(text) {
@@ -941,14 +1301,7 @@ class YouTubeTranslator {
   _setStatus(state) {
     // Обновляем иконку кнопки
     if (this.btnEl) {
-      if (this._isShorts()) {
-        // В Shorts — SVG + подпись
-        this.btnEl.innerHTML =
-          this._svgLogo(state) +
-          '<span style="font-size:11px;margin-top:2px;color:#fff;font-family:Roboto,Arial,sans-serif;">A/文</span>';
-      } else {
-        this.btnEl.innerHTML = this._svgLogo(state);
-      }
+      this.btnEl.innerHTML = this._svgLogo(state);
     }
 
     // Обновляем тогл в панели
@@ -964,9 +1317,11 @@ class YouTubeTranslator {
     } else if (state === 'active') {
       toggleBtn.className   = 'active';
       toggleLabel.textContent = 'Перевод включён';
+      this._hideSpinner();
     } else {
       toggleBtn.className   = '';
       toggleLabel.textContent = 'Перевод выключен';
+      this._hideSpinner();
     }
   }
 

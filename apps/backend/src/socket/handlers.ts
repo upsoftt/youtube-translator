@@ -170,3 +170,21 @@ export function setupSocketHandlers(io: Server): void {
 
   console.log('[WebSocket] Обработчики настроены');
 }
+
+/**
+ * Останавливает все активные оркестраторы (для graceful shutdown).
+ */
+export async function stopAllOrchestrators(): Promise<void> {
+  const entries = Array.from(activeOrchestrators.entries());
+  if (entries.length === 0) return;
+  console.log(`[WebSocket] Остановка ${entries.length} активных оркестраторов...`);
+  await Promise.all(entries.map(async ([id, orch]) => {
+    try {
+      await orch.stop();
+    } catch (err) {
+      console.error(`[WebSocket] Ошибка остановки оркестратора ${id}:`, err);
+    }
+  }));
+  activeOrchestrators.clear();
+  console.log('[WebSocket] Все оркестраторы остановлены');
+}

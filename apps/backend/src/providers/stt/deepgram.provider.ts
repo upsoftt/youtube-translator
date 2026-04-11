@@ -16,15 +16,27 @@ export class DeepgramSTTProvider implements STTProvider {
   private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
   private pendingChunks: Buffer[] = [];
+  private destroyed = false;
+  private reconnectAttempts = 0;
+  private static readonly MAX_RECONNECT_ATTEMPTS = 5;
+  private static readonly RECONNECT_BASE_DELAY_MS = 1000;
 
   async initialize(options: STTProviderOptions): Promise<void> {
     this.apiKey = options.apiKey || '';
     this.language = options.language || 'en';
+    this.destroyed = false;
+    this.reconnectAttempts = 0;
 
     if (!this.apiKey) {
       throw new Error('[DeepgramSTT] API ключ обязателен');
     }
 
+    this.connectWebSocket();
+    console.log(`[DeepgramSTT] Инициализирован, язык: ${this.language}`);
+  }
+
+  private connectWebSocket(): void {
+    this.isReady = false;
     this.readyPromise = new Promise(resolve => {
       this.readyResolve = resolve;
     });
@@ -47,6 +59,7 @@ export class DeepgramSTTProvider implements STTProvider {
     this.ws.on('open', () => {
       console.log('[DeepgramSTT] WebSocket открыт');
       this.isReady = true;
+      this.reconnectAttempts = 0;
       this.readyResolve?.();
       // Отправляем накопленные чанки
       for (const chunk of this.pendingChunks) {
@@ -94,9 +107,19 @@ export class DeepgramSTTProvider implements STTProvider {
     this.ws.on('close', (code: number, reason: Buffer) => {
       console.log(`[DeepgramSTT] WebSocket закрыт: ${code} ${reason?.toString()}`);
       this.isReady = false;
-    });
 
-    console.log(`[DeepgramSTT] Инициализирован, язык: ${this.language}`);
+      // Автоматический реконнект если не был вызван destroy()
+      if (!this.destroyed && this.reconnectAttempts < DeepgramSTTProvider.MAX_RECONNECT_ATTEMPTS) {
+        this.reconnectAttempts++;
+        const delay = DeepgramSTTProvider.RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempts - 1);
+        console.log(`[DeepgramSTT] Реконнект ${this.reconnectAttempts}/${DeepgramSTTProvider.MAX_RECONNECT_ATTEMPTS} через ${delay}ms...`);
+        setTimeout(() => {
+          if (!this.destroyed) this.connectWebSocket();
+        }, delay);
+      } else if (!this.destroyed) {
+        console.error(`[DeepgramSTT] Превышен лимит реконнектов (${DeepgramSTTProvider.MAX_RECONNECT_ATTEMPTS})`);
+      }
+    });
   }
 
   /** Ждёт готовности WebSocket */
@@ -116,6 +139,7 @@ export class DeepgramSTTProvider implements STTProvider {
   }
 
   async destroy(): Promise<void> {
+    this.destroyed = true;
     if (this.ws) {
       try {
         if (this.ws.readyState === WebSocket.OPEN) {

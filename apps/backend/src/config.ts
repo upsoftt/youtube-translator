@@ -16,6 +16,10 @@ export interface AppConfig {
   defaultSttProvider: string;
   defaultTranslationProvider: string;
   defaultTtsProvider: string;
+  /** URL локального CosyVoice сервера в WSL2 */
+  cosyvoiceUrl: string;
+  /** Bearer-токен для авторизации на CosyVoice сервере */
+  cosyvoiceApiKey: string;
 }
 
 export const config: AppConfig = {
@@ -30,4 +34,6 @@ export const config: AppConfig = {
   defaultSttProvider: process.env.DEFAULT_STT_PROVIDER || 'local-whisper',
   defaultTranslationProvider: process.env.DEFAULT_TRANSLATION_PROVIDER || 'libre',
   defaultTtsProvider: process.env.DEFAULT_TTS_PROVIDER || 'edge-tts',
+  cosyvoiceUrl: process.env.COSYVOICE_URL || 'http://localhost:8020',
+  cosyvoiceApiKey: process.env.COSYVOICE_API_KEY || '',
 };

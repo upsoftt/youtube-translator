@@ -6,7 +6,7 @@
   "openFolder": true,
   "components": [
     {
-      "name": null,
+      "name": "Backend",
       "lifecycle": {
         "start": "pythonw trayconsole_bridge.py",
         "stop": null,
@@ -17,6 +17,17 @@
       "customActions": [
         { "label": "Открыть веб-интерфейс", "command": "open_ui" }
       ]
+    },
+    {
+      "name": "CosyVoice TTS (WSL2)",
+      "lifecycle": {
+        "start": "pythonw trayconsole_cosyvoice_bridge.py",
+        "stop": null,
+        "build": null
+      },
+      "pipe": "trayconsole_cosyvoice",
+      "window": false,
+      "customActions": []
     }
   ]
 }

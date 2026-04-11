@@ -1,10 +1,14 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
+import { spawn } from 'child_process';
 import { YouTubeStreamer } from './youtube-streamer';
 import { DeepgramSTTProvider } from '../providers/stt/deepgram.provider';
 import { OpenAITranslationProvider } from '../providers/translation/openai.provider';
 import { DeepgramTTSProvider } from '../providers/tts/deepgram-tts.provider';
 import { OpenAITTSProvider } from '../providers/tts/openai-tts.provider';
+import { EdgeTTSProvider } from '../providers/tts/edge-tts.provider';
+import { CosyVoiceTTSProvider } from '../providers/tts/cosyvoice-tts.provider';
+import { ElevenLabsTTSProvider } from '../providers/tts/elevenlabs-tts.provider';
 import { TTSProvider } from '../providers/tts/tts.interface';
 import { GenderDetector } from '../utils/gender-detector';
 import { TranslationSettings, TranslationSegment } from './orchestrator';
@@ -24,6 +28,31 @@ import { getMp3Duration } from '../utils/mp3-duration';
  * 5. Далее сегменты приходят в реальном времени с таймштампами
  */
 export class StreamingOrchestrator extends EventEmitter {
+  // --- Константы ---
+  /** Максимальное количество ошибок подряд до остановки трансляции */
+  private static readonly MAX_CONSECUTIVE_ERRORS = 5;
+  /** Таймаут принудительного resume_video (мс) */
+  private static readonly RESUME_TIMEOUT_MS = 15000;
+  /** Lookahead: обрабатываем не более чем на N секунд вперёд от playbackTime */
+  private static readonly SUBTITLE_LOOKAHEAD_SEC = 15;
+  /** Интервал опроса когда pipeline ждёт догонки видео (мс) */
+  private static readonly WAIT_POLL_MS = 500;
+  /** Задержка перед retry при ошибке перевода/TTS (мс) */
+  private static readonly RETRY_DELAY_MS = 500;
+  /** Максимальная длина предложения при разбиении (символов) */
+  private static readonly MAX_SENTENCE_LENGTH = 120;
+  /** Длительность сегмента по умолчанию если не указана (сек) */
+  private static readonly DEFAULT_SEGMENT_DURATION_SEC = 5;
+  /** Сколько секунд "в прошлом" допускается для сегмента */
+  private static readonly STALE_SEGMENT_THRESHOLD_SEC = 1;
+  /** Секунд контекста перед seek-позицией */
+  private static readonly SEEK_CONTEXT_SEC = 1;
+  /** Пауза между seek и стартом нового pipeline (мс) */
+  private static readonly SEEK_SETTLE_MS = 100;
+  /** Длительность голосового сэмпла для клонирования (сек) */
+  private static readonly VOICE_SAMPLE_DURATION_SEC = 15;
+
+  // --- Состояние ---
   private youtubeStreamer: YouTubeStreamer;
   private sttProvider: DeepgramSTTProvider | null = null;
   private translationProvider: OpenAITranslationProvider | null = null;
@@ -35,14 +64,12 @@ export class StreamingOrchestrator extends EventEmitter {
   private playbackTime = 0;
   private currentVideoUrl = '';
   private currentSettings: TranslationSettings | null = null;
-  private seekOffset = 0; // Смещение seek в секундах
-  private usingSubtitles = false; // Используем субтитры вместо STT
+  private seekOffset = 0;
+  private usingSubtitles = false;
   private subtitleSegments: SubtitleSegment[] = [];
-  private subtitlePipelineVersion = 0; // Инкрементируется при seek — прерывает старый цикл
+  private subtitlePipelineVersion = 0;
   private resumeTimeout: ReturnType<typeof setTimeout> | null = null;
-  private resumeTimeoutMs = 15000; // Таймаут принудительного resume_video
-  private consecutiveErrors = 0; // Счётчик ошибок подряд
-  private static readonly MAX_CONSECUTIVE_ERRORS = 5;
+  private consecutiveErrors = 0;
 
   constructor() {
     super();
@@ -144,21 +171,106 @@ export class StreamingOrchestrator extends EventEmitter {
       targetLanguage: settings.targetLanguage,
     });
 
-    // TTS — OpenAI TTS для языков без поддержки DeepGram Aura-2, DeepGram для остальных
-    const openaiTtsLanguages = ['ru', 'zh', 'ko'];
-    if (openaiTtsLanguages.includes(settings.targetLanguage) && openaiKey) {
-      this.ttsProvider = new OpenAITTSProvider();
-      await this.ttsProvider.initialize({ apiKey: openaiKey, language: settings.targetLanguage });
-    } else {
-      this.ttsProvider = new DeepgramTTSProvider();
-      await this.ttsProvider.initialize({ apiKey: deepgramKey, language: settings.targetLanguage });
+    // TTS — выбирается по settings.ttsProvider (модульный реестр)
+    const cfg = settings.ttsProviderConfig || {};
+
+    // Если выбран CosyVoice с клонированием голоса — извлекаем сэмпл
+    let referenceAudio: Buffer | undefined;
+    if (settings.voiceClone && settings.ttsProvider === 'cosyvoice') {
+      console.log('[StreamingOrch] Извлекаем голосовой сэмпл...');
+      referenceAudio = await this.extractVoiceSample(this.currentVideoUrl, StreamingOrchestrator.VOICE_SAMPLE_DURATION_SEC);
+    }
+
+    switch (settings.ttsProvider) {
+      case 'openai-tts':
+        this.ttsProvider = new OpenAITTSProvider();
+        await this.ttsProvider.initialize({ apiKey: cfg.apiKey || openaiKey, language: settings.targetLanguage });
+        break;
+
+      case 'cosyvoice': {
+        const cosyProvider = new CosyVoiceTTSProvider();
+        await cosyProvider.initialize({
+          serverUrl:      cfg.serverUrl || config.cosyvoiceUrl,
+          apiKey:         cfg.apiKey    || config.cosyvoiceApiKey,
+          language:       settings.targetLanguage,
+          referenceAudio,
+        });
+        this.ttsProvider = cosyProvider;
+        break;
+      }
+
+      case 'elevenlabs':
+        this.ttsProvider = new ElevenLabsTTSProvider();
+        await this.ttsProvider.initialize({
+          apiKey: cfg.apiKey,
+          voice: cfg.voiceId,
+          language: settings.targetLanguage,
+        });
+        break;
+
+      case 'deepgram-tts':
+        this.ttsProvider = new DeepgramTTSProvider();
+        await this.ttsProvider.initialize({ apiKey: cfg.apiKey || deepgramKey, language: settings.targetLanguage });
+        break;
+
+      case 'edge-tts':
+        this.ttsProvider = new EdgeTTSProvider();
+        await this.ttsProvider.initialize({ language: settings.targetLanguage });
+        break;
+
+      default: {
+        // Умолчание: для ru/zh/ko — OpenAI, для остальных — DeepGram (обратная совместимость)
+        const openaiTtsLanguages = ['ru', 'zh', 'ko'];
+        if (openaiTtsLanguages.includes(settings.targetLanguage) && openaiKey) {
+          this.ttsProvider = new OpenAITTSProvider();
+          await this.ttsProvider.initialize({ apiKey: openaiKey, language: settings.targetLanguage });
+        } else {
+          this.ttsProvider = new DeepgramTTSProvider();
+          await this.ttsProvider.initialize({ apiKey: deepgramKey, language: settings.targetLanguage });
+        }
+        break;
+      }
     }
 
     // Gender Detector — параллельный MP3→PCM через ffmpeg + pitch анализ
     this.genderDetector = new GenderDetector();
     this.genderDetector.start();
 
+    console.log(`[StreamingOrch] TTS провайдер: ${this.ttsProvider?.name} (запрошен: ${settings.ttsProvider})`);
     console.log('[StreamingOrch] Провайдеры + GenderDetector инициализированы');
+  }
+
+  /**
+   * Извлекает аудио-сэмпл из начала видео через yt-dlp + ffmpeg.
+   * Используется для zero-shot клонирования голоса через CosyVoice.
+   */
+  private extractVoiceSample(videoUrl: string, durationSec: number): Promise<Buffer> {
+    return new Promise((resolve) => {
+      const ytdlp = spawn(config.ytdlpPath, ['-f', 'bestaudio', '-g', '--no-playlist', videoUrl]);
+      let audioUrl = '';
+      ytdlp.stdout.on('data', (d: Buffer) => { audioUrl += d.toString(); });
+      ytdlp.on('close', (code) => {
+        if (code !== 0 || !audioUrl.trim()) {
+          console.warn('[StreamingOrch] Не удалось получить URL аудио для сэмпла');
+          resolve(Buffer.alloc(0));
+          return;
+        }
+        const url = audioUrl.trim().split('\n')[0];
+        const chunks: Buffer[] = [];
+        const ffmpeg = spawn(config.ffmpegPath, [
+          '-i', url, '-t', String(durationSec),
+          '-ar', '16000', '-ac', '1', '-f', 'wav', 'pipe:1',
+        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+        ffmpeg.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+        ffmpeg.on('close', () => {
+          const buf = Buffer.concat(chunks);
+          console.log(`[StreamingOrch] Голосовой сэмпл: ${buf.length} байт`);
+          resolve(buf.length > 0 ? buf : Buffer.alloc(0));
+        });
+        ffmpeg.on('error', () => resolve(Buffer.alloc(0)));
+      });
+      ytdlp.on('error', () => resolve(Buffer.alloc(0)));
+    });
   }
 
   private emitProviderInfo(sttSource: string): void {
@@ -179,9 +291,8 @@ export class StreamingOrchestrator extends EventEmitter {
    */
   private async startSubtitlePipeline(seekSec: number): Promise<void> {
     // Lookahead: обрабатываем не более чем на N секунд вперёд от playbackTime
-    const SUBTITLE_LOOKAHEAD_SEC = 7;
-    // Интервал опроса когда pipeline ждёт догонки видео (мс)
-    const WAIT_POLL_MS = 2000;
+    const SUBTITLE_LOOKAHEAD_SEC = StreamingOrchestrator.SUBTITLE_LOOKAHEAD_SEC;
+    const WAIT_POLL_MS = StreamingOrchestrator.WAIT_POLL_MS;
 
     // Фиксируем версию при запуске — при seek она изменится и цикл прервётся
     const myVersion = this.subtitlePipelineVersion;
@@ -277,7 +388,7 @@ export class StreamingOrchestrator extends EventEmitter {
       const trimmed = sentence.trim();
       if (!trimmed) continue;
 
-      if (current.length + trimmed.length > 120 && current.length > 0) {
+      if (current.length + trimmed.length > StreamingOrchestrator.MAX_SENTENCE_LENGTH && current.length > 0) {
         result.push(current.trim());
         current = trimmed;
       } else {
@@ -291,6 +402,13 @@ export class StreamingOrchestrator extends EventEmitter {
   private async processSegment(text: string, startTime: number, duration?: number, gender?: SpeakerGender): Promise<void> {
     if (!this.translationProvider || !this.ttsProvider || !this.isRunning) return;
 
+    // Пропускаем сегменты, которые уже полностью в прошлом
+    const segEndTime = startTime + (duration || StreamingOrchestrator.DEFAULT_SEGMENT_DURATION_SEC);
+    if (this.firstSegmentSent && segEndTime < this.playbackTime - StreamingOrchestrator.STALE_SEGMENT_THRESHOLD_SEC) {
+      console.log(`[StreamingOrch] Пропуск устаревшего сегмента @ ${startTime.toFixed(1)}s (video @ ${this.playbackTime.toFixed(1)}s)`);
+      return;
+    }
+
     // Проверка лимита ошибок подряд
     if (this.consecutiveErrors >= StreamingOrchestrator.MAX_CONSECUTIVE_ERRORS) {
       console.error(`[StreamingOrch] ${this.consecutiveErrors} ошибок подряд — останавливаем трансляцию`);
@@ -300,12 +418,13 @@ export class StreamingOrchestrator extends EventEmitter {
     }
 
     // Перевод с 1 retry
+    if (!this.firstSegmentSent) this.emit('status', 'Перевод текста…');
     let translatedText: string | null = null;
     try {
       translatedText = await this.translationProvider.translate(text);
     } catch (error) {
       console.warn(`[StreamingOrch] Перевод fail #1, retry через 500мс:`, error);
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, StreamingOrchestrator.RETRY_DELAY_MS));
       try {
         translatedText = await this.translationProvider.translate(text);
       } catch (retryError) {
@@ -319,7 +438,7 @@ export class StreamingOrchestrator extends EventEmitter {
 
     // Разбиваем на предложения
     const sentences = this.splitIntoSentences(translatedText);
-    const segDuration = (duration || 5) / sentences.length;
+    const segDuration = (duration || StreamingOrchestrator.DEFAULT_SEGMENT_DURATION_SEC) / sentences.length;
 
     for (let i = 0; i < sentences.length; i++) {
       if (!this.isRunning) return;
@@ -327,13 +446,20 @@ export class StreamingOrchestrator extends EventEmitter {
       const sentenceText = sentences[i];
       const sentenceStartTime = startTime + i * segDuration;
 
+      // Пропуск предложений, которые уже в прошлом
+      if (this.firstSegmentSent && sentenceStartTime + segDuration < this.playbackTime - StreamingOrchestrator.STALE_SEGMENT_THRESHOLD_SEC) {
+        console.log(`[StreamingOrch] Пропуск предложения @ ${sentenceStartTime.toFixed(1)}s`);
+        continue;
+      }
+
       // TTS с 1 retry; при провале — отправляем сегмент без аудио (только субтитр)
+      if (!this.firstSegmentSent) this.emit('status', 'Озвучивание…');
       let audioBuffer: Buffer = Buffer.alloc(0);
       try {
         audioBuffer = await this.ttsProvider.synthesize(sentenceText, gender);
       } catch (error) {
         console.warn(`[StreamingOrch] TTS fail #1, retry через 500мс:`, error);
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, StreamingOrchestrator.RETRY_DELAY_MS));
         try {
           audioBuffer = await this.ttsProvider.synthesize(sentenceText, gender);
         } catch (retryError) {
@@ -371,7 +497,7 @@ export class StreamingOrchestrator extends EventEmitter {
         console.log('[StreamingOrch] Первый сегмент → resume_video');
       }
 
-      console.log(`[StreamingOrch] #${this.segmentCounter}: "${sentenceText.substring(0, 50)}" [${gender}] @ ${sentenceStartTime.toFixed(1)}s`);
+      console.log(`[StreamingOrch] #${this.segmentCounter}: "${sentenceText.substring(0, 50)}" [${gender}] @ ${sentenceStartTime.toFixed(1)}s (video @ ${this.playbackTime.toFixed(1)}s)`);
     }
   }
 
@@ -406,7 +532,7 @@ export class StreamingOrchestrator extends EventEmitter {
       this.emit('status', 'Запуск распознавания...');
 
       // Небольшая пауза — даём старому циклу выйти на следующей итерации
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, StreamingOrchestrator.SEEK_SETTLE_MS));
 
       if (!this.isRunning || this.subtitlePipelineVersion !== newVersion) return;
 
@@ -429,7 +555,7 @@ export class StreamingOrchestrator extends EventEmitter {
     }
 
     // Пересоздаём STT и GenderDetector
-    this.seekOffset = Math.max(0, timeSec - 1); // 1с до для контекста
+    this.seekOffset = Math.max(0, timeSec - StreamingOrchestrator.SEEK_CONTEXT_SEC);
 
     const deepgramKey = this.currentSettings.apiKeys.deepgram || config.deepgramApiKey;
     this.sttProvider = new DeepgramSTTProvider();
@@ -455,9 +581,9 @@ export class StreamingOrchestrator extends EventEmitter {
         this.firstSegmentSent = true;
         this.emit('resume_video');
         this.emit('status', 'Перевод активен');
-        console.warn(`[StreamingOrch] TIMEOUT: resume_video forced after ${this.resumeTimeoutMs / 1000}s`);
+        console.warn(`[StreamingOrch] TIMEOUT: resume_video forced after ${StreamingOrchestrator.RESUME_TIMEOUT_MS / 1000}s`);
       }
-    }, this.resumeTimeoutMs);
+    }, StreamingOrchestrator.RESUME_TIMEOUT_MS);
   }
 
   private clearResumeTimeout(): void {
@@ -490,6 +616,10 @@ export class StreamingOrchestrator extends EventEmitter {
       await this.ttsProvider.destroy();
       this.ttsProvider = null;
     }
+
+    // Очищаем кэш субтитров
+    this.subtitleSegments = [];
+    this.currentSettings = null;
 
     console.log('[StreamingOrch] Остановлен');
   }

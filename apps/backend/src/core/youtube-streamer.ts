@@ -21,8 +21,13 @@ export class YouTubeStreamer extends EventEmitter {
   /**
    * Получает прямой URL видео для воспроизведения на клиенте
    */
+  private static readonly YTDLP_TIMEOUT_MS = 30000;
+
   async getVideoUrl(youtubeUrl: string): Promise<string> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => { if (!settled) { settled = true; clearTimeout(timer); fn(); } };
+
       const proc = spawn(this.ytdlpPath, [
         '-g',
         '-f', 'best',
@@ -35,17 +40,22 @@ export class YouTubeStreamer extends EventEmitter {
       proc.stdout.on('data', (data: Buffer) => { output += data.toString(); });
       proc.stderr.on('data', (data: Buffer) => { errorOutput += data.toString(); });
 
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+        settle(() => reject(new Error(`[yt-dlp] Таймаут получения URL видео (${YouTubeStreamer.YTDLP_TIMEOUT_MS / 1000}с)`)));
+      }, YouTubeStreamer.YTDLP_TIMEOUT_MS);
+
       proc.on('close', (code) => {
         if (code === 0 && output.trim()) {
           const urls = output.trim().split('\n');
-          resolve(urls[0]);
+          settle(() => resolve(urls[0]));
         } else {
-          reject(new Error(`yt-dlp не удалось получить URL видео: ${errorOutput}`));
+          settle(() => reject(new Error(`yt-dlp не удалось получить URL видео: ${errorOutput}`)));
         }
       });
 
       proc.on('error', (err) => {
-        reject(new Error(`Не удалось запустить yt-dlp: ${err.message}`));
+        settle(() => reject(new Error(`Не удалось запустить yt-dlp: ${err.message}`)));
       });
     });
   }
@@ -55,6 +65,9 @@ export class YouTubeStreamer extends EventEmitter {
    */
   private async getAudioUrl(youtubeUrl: string): Promise<string> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => { if (!settled) { settled = true; clearTimeout(timer); fn(); } };
+
       const proc = spawn(this.ytdlpPath, [
         '-g',
         '-f', 'bestaudio',
@@ -67,15 +80,22 @@ export class YouTubeStreamer extends EventEmitter {
       proc.stdout.on('data', (data: Buffer) => { output += data.toString(); });
       proc.stderr.on('data', (data: Buffer) => { errorOutput += data.toString(); });
 
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+        settle(() => reject(new Error(`[yt-dlp] Таймаут получения аудио URL (${YouTubeStreamer.YTDLP_TIMEOUT_MS / 1000}с)`)));
+      }, YouTubeStreamer.YTDLP_TIMEOUT_MS);
+
       proc.on('close', (code) => {
         if (code === 0 && output.trim()) {
-          resolve(output.trim().split('\n')[0]);
+          settle(() => resolve(output.trim().split('\n')[0]));
         } else {
-          reject(new Error(`yt-dlp audio URL failed: ${errorOutput}`));
+          settle(() => reject(new Error(`yt-dlp audio URL failed: ${errorOutput}`)));
         }
       });
 
-      proc.on('error', (err) => reject(err));
+      proc.on('error', (err) => {
+        settle(() => reject(err));
+      });
     });
   }
 

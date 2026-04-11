@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import { STTProvider, STTProviderOptions, STTSegment, SpeakerGender } from './stt.interface';
 import { config } from '../../config';
+import { detectGenderFromPCM } from '../../utils/gender-detector';
 
 /**
  * Локальный STT провайдер на основе whisper.cpp (через pywhispercpp).
@@ -341,98 +342,52 @@ export class LocalWhisperProvider implements STTProvider {
     }
   }
 
-  /**
-   * Определяет пол говорящего по частоте основного тона (pitch).
-   * PCM формат: float32le, 16kHz, mono.
-   * Мужской голос: 85-180 Hz, женский: 165-300 Hz.
-   * Используем автокорреляцию на фрагменте ~1 секунда.
-   */
   private detectGender(pcmData: Buffer): SpeakerGender {
-    const sampleRate = 16000;
-    const samples = new Float32Array(pcmData.buffer, pcmData.byteOffset, pcmData.byteLength / 4);
-
-    // Берём 1 секунду из середины
-    const start = Math.floor(Math.max(0, (samples.length - sampleRate) / 2));
-    const end = Math.min(samples.length, start + sampleRate);
-    const segment = samples.slice(start, end);
-
-    if (segment.length < 1600) return 'unknown'; // слишком мало данных
-
-    // Автокорреляция для определения pitch
-    const minLag = Math.floor(sampleRate / 300); // 300Hz max (high female)
-    const maxLag = Math.floor(sampleRate / 75);  // 75Hz min (low male)
-
-    let bestLag = 0;
-    let bestCorr = -1;
-
-    // Анализируем окно 20ms с шагом
-    const windowSize = Math.floor(sampleRate * 0.03); // 30ms
-    const numWindows = Math.floor(segment.length / windowSize) - 1;
-    const pitches: number[] = [];
-
-    for (let w = 0; w < Math.min(numWindows, 20); w++) {
-      const wStart = w * windowSize;
-      let bestWCorr = -1;
-      let bestWLag = 0;
-
-      for (let lag = minLag; lag <= maxLag && wStart + lag + windowSize < segment.length; lag++) {
-        let corr = 0;
-        let energy1 = 0;
-        let energy2 = 0;
-
-        for (let i = 0; i < windowSize; i++) {
-          corr += segment[wStart + i] * segment[wStart + i + lag];
-          energy1 += segment[wStart + i] * segment[wStart + i];
-          energy2 += segment[wStart + i + lag] * segment[wStart + i + lag];
-        }
-
-        const norm = Math.sqrt(energy1 * energy2);
-        if (norm > 0.001) {
-          const normalizedCorr = corr / norm;
-          if (normalizedCorr > bestWCorr) {
-            bestWCorr = normalizedCorr;
-            bestWLag = lag;
-          }
-        }
-      }
-
-      // Считаем только уверенные результаты (корреляция > 0.5)
-      if (bestWCorr > 0.5 && bestWLag > 0) {
-        pitches.push(sampleRate / bestWLag);
-      }
-    }
-
-    if (pitches.length < 3) return 'unknown';
-
-    // Медианный pitch
-    pitches.sort((a, b) => a - b);
-    const medianPitch = pitches[Math.floor(pitches.length / 2)];
-
-    // Порог: < 165 Hz = мужской, > 165 Hz = женский
-    const gender: SpeakerGender = medianPitch < 165 ? 'male' : 'female';
-    console.log(`[LocalWhisper] Pitch: ${medianPitch.toFixed(0)}Hz → ${gender} (из ${pitches.length} окон)`);
-    return gender;
+    return detectGenderFromPCM(pcmData);
   }
 
   async destroy(): Promise<void> {
-    // Закрываем ffmpeg
-    if (this.ffmpegProcess) {
-      try { this.ffmpegProcess.stdin?.end(); } catch {}
-      setTimeout(() => {
-        this.ffmpegProcess?.kill();
-        this.ffmpegProcess = null;
-      }, 1000);
-    }
+    const killProcess = (proc: ChildProcess | null, name: string, gracefulMs: number): Promise<void> => {
+      if (!proc) return Promise.resolve();
+      return new Promise((resolve) => {
+        let resolved = false;
+        const done = () => { if (!resolved) { resolved = true; resolve(); } };
 
-    // Закрываем whisper worker
+        proc.on('close', done);
+        proc.on('error', done);
+
+        // Graceful: закрываем stdin / шлём quit
+        try { proc.stdin?.end(); } catch {}
+
+        // Fallback: SIGKILL после gracefulMs
+        setTimeout(() => {
+          if (!resolved) {
+            try { proc.kill('SIGKILL'); } catch {}
+            console.warn(`[LocalWhisper] ${name} принудительно убит`);
+            setTimeout(done, 500);
+          }
+        }, gracefulMs);
+      });
+    };
+
+    // Закрываем whisper worker (graceful quit)
     if (this.workerProcess) {
       try {
         this.workerProcess.stdin?.write(JSON.stringify({ cmd: 'quit' }) + '\n');
       } catch {}
-      setTimeout(() => {
-        this.workerProcess?.kill();
-        this.workerProcess = null;
-      }, 2000);
     }
+
+    // Ждём завершения обоих процессов параллельно
+    await Promise.all([
+      killProcess(this.ffmpegProcess, 'ffmpeg', 1000),
+      killProcess(this.workerProcess, 'whisper-worker', 3000),
+    ]);
+
+    this.ffmpegProcess = null;
+    this.workerProcess = null;
+    this.pcmBuffer = [];
+    this.pcmBufferSize = 0;
+    this.onSegmentCallback = null;
+    console.log('[LocalWhisper] Завершён');
   }
 }

@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
+import { spawn } from 'child_process';
 import { YouTubeStreamer } from './youtube-streamer';
 import { STTProvider, SpeakerGender } from '../providers/stt/stt.interface';
 import { TranslationProvider } from '../providers/translation/translation.interface';
@@ -11,6 +12,8 @@ import { LibreTranslateProvider } from '../providers/translation/libre.provider'
 import { OpenAITranslationProvider } from '../providers/translation/openai.provider';
 import { EdgeTTSProvider } from '../providers/tts/edge-tts.provider';
 import { DeepgramTTSProvider } from '../providers/tts/deepgram-tts.provider';
+import { OpenAITTSProvider } from '../providers/tts/openai-tts.provider';
+import { CosyVoiceTTSProvider } from '../providers/tts/cosyvoice-tts.provider';
 import { config } from '../config';
 import { getMp3Duration } from '../utils/mp3-duration';
 
@@ -22,6 +25,10 @@ export interface TranslationSettings {
   sttProvider: string;
   translationProvider: string;
   ttsProvider: string;
+  /** Конфигурация конкретного TTS-провайдера (apiKey, serverUrl и т.д.) */
+  ttsProviderConfig?: Record<string, string>;
+  /** Клонировать голос из видео (только для провайдеров с supportsVoiceClone) */
+  voiceClone?: boolean;
   translationMode?: 'free' | 'streaming';
   seekTime?: number;
   preferSubtitles?: boolean;
@@ -86,7 +93,7 @@ export class Orchestrator extends EventEmitter {
     try {
       // 1. Инициализируем провайдеры
       this.emit('status', 'Инициализация провайдеров...');
-      await this.initializeProviders(settings);
+      await this.initializeProviders(settings, videoUrl);
 
       // 2. Получаем прямой URL видео
       this.emit('status', 'Получение ссылки на видео...');
@@ -111,21 +118,21 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Инициализирует провайдеры на основе настроек клиента
+   * Инициализирует провайдеры на основе настроек клиента.
+   * TTS-провайдер выбирается из реестра по settings.ttsProvider,
+   * конфигурируется через settings.ttsProviderConfig.
    */
-  private async initializeProviders(settings: TranslationSettings): Promise<void> {
+  private async initializeProviders(settings: TranslationSettings, videoUrl?: string): Promise<void> {
     // Fallback на серверные ключи из .env
     const deepgramKey = settings.apiKeys.deepgram || config.deepgramApiKey;
-    const openaiKey = settings.apiKeys.openai || config.openaiApiKey;
+    const openaiKey   = settings.apiKeys.openai   || config.openaiApiKey;
+    const cfg         = settings.ttsProviderConfig || {};
 
     // STT провайдер
     switch (settings.sttProvider) {
       case 'deepgram':
         this.sttProvider = new DeepgramSTTProvider();
-        await this.sttProvider.initialize({
-          apiKey: deepgramKey,
-          language: 'en', // Исходный язык видео
-        });
+        await this.sttProvider.initialize({ apiKey: deepgramKey, language: 'en' });
         break;
       case 'local-whisper':
         this.sttProvider = new LocalWhisperProvider();
@@ -142,42 +149,120 @@ export class Orchestrator extends EventEmitter {
     switch (settings.translationProvider) {
       case 'openai':
         this.translationProvider = new OpenAITranslationProvider();
-        await this.translationProvider.initialize({
-          apiKey: openaiKey,
-          sourceLanguage: 'en',
-          targetLanguage: settings.targetLanguage,
-        });
+        await this.translationProvider.initialize({ apiKey: openaiKey, sourceLanguage: 'en', targetLanguage: settings.targetLanguage });
         break;
       case 'libre':
       default:
         this.translationProvider = new LibreTranslateProvider();
-        await this.translationProvider.initialize({
-          sourceLanguage: 'en',
-          targetLanguage: settings.targetLanguage,
-        });
+        await this.translationProvider.initialize({ sourceLanguage: 'en', targetLanguage: settings.targetLanguage });
         break;
     }
 
-    // TTS провайдер
+    // TTS провайдер — выбирается из реестра, конфигурируется динамически
+    let referenceAudio: Buffer | undefined;
+    if (settings.voiceClone && settings.ttsProvider === 'cosyvoice' && videoUrl) {
+      this.emit('status', 'Извлечение голосового сэмпла...');
+      referenceAudio = await this.extractVoiceSample(videoUrl, 15);
+    }
+
     switch (settings.ttsProvider) {
-      case 'deepgram-tts':
-        this.ttsProvider = new DeepgramTTSProvider();
+      case 'openai-tts':
+        this.ttsProvider = new OpenAITTSProvider();
         await this.ttsProvider.initialize({
-          apiKey: deepgramKey,
+          apiKey:   cfg.apiKey || openaiKey,
           language: settings.targetLanguage,
         });
         break;
+
+      case 'cosyvoice': {
+        const cosyProvider = new CosyVoiceTTSProvider();
+        await cosyProvider.initialize({
+          serverUrl:      cfg.serverUrl || config.cosyvoiceUrl,
+          apiKey:         cfg.apiKey    || config.cosyvoiceApiKey,
+          language:       settings.targetLanguage,
+          referenceAudio,
+        });
+        this.ttsProvider = cosyProvider;
+        break;
+      }
+
+      case 'deepgram-tts':
+        this.ttsProvider = new DeepgramTTSProvider();
+        await this.ttsProvider.initialize({
+          apiKey:   cfg.apiKey || deepgramKey,
+          language: settings.targetLanguage,
+        });
+        break;
+
       case 'edge-tts':
       default:
         this.ttsProvider = new EdgeTTSProvider();
-        await this.ttsProvider.initialize({
-          language: settings.targetLanguage,
-        });
+        await this.ttsProvider.initialize({ language: settings.targetLanguage });
         break;
     }
 
     console.log(`[Оркестратор] Провайдеры: STT=${this.sttProvider.name}, ` +
-      `Translation=${this.translationProvider.name}, TTS=${this.ttsProvider.name}`);
+      `Translation=${this.translationProvider.name}, TTS=${this.ttsProvider.name}` +
+      (referenceAudio ? ' [voice clone]' : ''));
+  }
+
+  /**
+   * Извлекает аудио-сэмпл из начала видео через yt-dlp + ffmpeg.
+   * Используется для zero-shot клонирования голоса.
+   * @param videoUrl - URL YouTube-видео
+   * @param durationSec - длительность сэмпла в секундах
+   * @returns WAV-буфер
+   */
+  private extractVoiceSample(videoUrl: string, durationSec: number): Promise<Buffer> {
+    return new Promise((resolve) => {
+      // yt-dlp выводит прямой URL аудио в stdout, ffmpeg читает его по pipe
+      const ytdlp = spawn(config.ytdlpPath, [
+        '-f', 'bestaudio',
+        '-g',              // только URL, без загрузки
+        '--no-playlist',
+        videoUrl,
+      ]);
+
+      let audioUrl = '';
+      ytdlp.stdout.on('data', (d: Buffer) => { audioUrl += d.toString(); });
+
+      ytdlp.on('close', (code) => {
+        if (code !== 0 || !audioUrl.trim()) {
+          console.warn('[Оркестратор] Не удалось получить URL аудио для голосового сэмпла');
+          resolve(Buffer.alloc(0));
+          return;
+        }
+
+        const url = audioUrl.trim().split('\n')[0];
+        const chunks: Buffer[] = [];
+
+        // ffmpeg декодирует первые N секунд и отдаёт WAV в stdout
+        const ffmpeg = spawn(config.ffmpegPath, [
+          '-i', url,
+          '-t', String(durationSec),
+          '-ar', '16000',    // 16kHz — стандарт для speech
+          '-ac', '1',        // моно
+          '-f', 'wav',
+          'pipe:1',
+        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+        ffmpeg.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+        ffmpeg.on('close', () => {
+          const buf = Buffer.concat(chunks);
+          console.log(`[Оркестратор] Голосовой сэмпл: ${buf.length} байт (${durationSec}с)`);
+          resolve(buf.length > 0 ? buf : Buffer.alloc(0));
+        });
+        ffmpeg.on('error', (err) => {
+          console.warn('[Оркестратор] ffmpeg ошибка при извлечении сэмпла:', err.message);
+          resolve(Buffer.alloc(0));
+        });
+      });
+
+      ytdlp.on('error', (err) => {
+        console.warn('[Оркестратор] yt-dlp ошибка:', err.message);
+        resolve(Buffer.alloc(0));
+      });
+    });
   }
 
   /**

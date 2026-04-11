@@ -80,7 +80,11 @@ export class EdgeTTSProvider implements TTSProvider {
 
   private runPythonTts(textFile: string, audioFile: string, voice?: string): Promise<void> {
     const useVoice = voice || this.voice;
+    const TIMEOUT_MS = 20000;
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+
       const script = `
 import asyncio, sys, edge_tts
 
@@ -95,22 +99,29 @@ asyncio.run(main())
 
       const proc = spawn(this.pythonPath, ['-c', script, textFile, useVoice, audioFile], {
         stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 15000,
       });
 
       let stderr = '';
       proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
 
+      // Принудительный таймаут — убиваем процесс если завис
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+        settle(() => reject(new Error(`[EdgeTTS] Таймаут синтеза (${TIMEOUT_MS / 1000}с)`)));
+      }, TIMEOUT_MS);
+
       proc.on('close', (code) => {
+        clearTimeout(timer);
         if (code === 0) {
-          resolve();
+          settle(() => resolve());
         } else {
-          reject(new Error(`Python edge-tts exited with code ${code}: ${stderr.substring(0, 200)}`));
+          settle(() => reject(new Error(`Python edge-tts exited with code ${code}: ${stderr.substring(0, 200)}`)));
         }
       });
 
       proc.on('error', (err) => {
-        reject(new Error(`Python spawn error: ${err.message}`));
+        clearTimeout(timer);
+        settle(() => reject(new Error(`Python spawn error: ${err.message}`)));
       });
     });
   }

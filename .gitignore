@@ -44,3 +44,7 @@ launch.json
 apps/backend/lib/
 apps/backend/models/
 apps/backend/ffmpeg.exe
+
+# MemPalace
+mempalace.yaml
+entities.json

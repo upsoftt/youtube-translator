@@ -10,6 +10,14 @@ export interface TTSOptions {
   voice?: string;
   /** API ключ (если требуется) */
   apiKey?: string;
+  /** URL сервера (для локальных провайдеров, напр. CosyVoice) */
+  serverUrl?: string;
+  /**
+   * Референсное аудио для zero-shot клонирования голоса.
+   * WAV-буфер из начала видео (~15 секунд).
+   * Используется провайдерами с supportsVoiceClone=true.
+   */
+  referenceAudio?: Buffer;
 }
 
 export type SpeakerGender = 'male' | 'female' | 'unknown';
