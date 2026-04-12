@@ -133,34 +133,36 @@ function parseJson3Subtitles(json: any): SubtitleSegment[] {
     segments.push({ text, startTime, duration });
   }
 
-  // Объединяем короткие сегменты (< 2 слов) с соседними
+  // Объединяем короткие сегменты (< 2 слов) с соседними.
+  // duration = время от начала первого до конца последнего (включая паузы),
+  // чтобы rate-fitting точно вписал TTS в реальное временное окно.
   const merged: SubtitleSegment[] = [];
   let buffer = '';
   let bufferStart = 0;
-  let bufferContentDuration = 0;
+  let bufferEnd = 0; // конец последнего сегмента в группе
 
   for (const seg of segments) {
     if (buffer.length === 0) {
       buffer = seg.text;
       bufferStart = seg.startTime;
-      bufferContentDuration = seg.duration;
+      bufferEnd = seg.startTime + seg.duration;
     } else {
       buffer += ' ' + seg.text;
-      bufferContentDuration += seg.duration;
+      bufferEnd = seg.startTime + seg.duration;
     }
 
     // Flush если достаточно длинный или это конец предложения
     const wordCount = buffer.split(/\s+/).length;
     const endsWithPunctuation = /[.!?]$/.test(buffer);
+    const totalDuration = bufferEnd - bufferStart;
 
-    if (wordCount >= 8 || endsWithPunctuation || bufferContentDuration > 5) {
+    if (wordCount >= 8 || endsWithPunctuation || totalDuration > 5) {
       merged.push({
         text: buffer.trim(),
         startTime: bufferStart,
-        duration: bufferContentDuration,
+        duration: totalDuration,
       });
       buffer = '';
-      bufferContentDuration = 0;
     }
   }
 
@@ -168,7 +170,7 @@ function parseJson3Subtitles(json: any): SubtitleSegment[] {
     merged.push({
       text: buffer.trim(),
       startTime: bufferStart,
-      duration: bufferContentDuration,
+      duration: bufferEnd - bufferStart,
     });
   }
 

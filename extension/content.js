@@ -72,7 +72,6 @@ class YouTubeTranslator {
     this.panelEl         = null;
     this.panelOpen       = false;
     this.audioQueue      = [];
-    this.isPlayingAudio  = false;
     this._currentAudio   = null;
     this._currentSegment = null;
     this.settings        = {};
@@ -1132,7 +1131,13 @@ class YouTubeTranslator {
     this.playbackTimer = null;
   }
 
-  // ── Audio queue ───────────────────────────────────────────────────────────
+  // ── Audio queue (time-locked scheduler) ─────────────────────────────────
+  //
+  // Принцип: каждый сегмент привязан к video.currentTime.
+  // Когда видео доходит до segment.startTime — начинаем воспроизведение.
+  // TTS ускоряется/замедляется ровно до audioDuration/segmentDuration,
+  // чтобы уложиться в окно оригинала.
+  // Если следующий сегмент наступил, а предыдущий ещё играет — прерываем.
 
   _handleSegment(segment) {
     if (segment.audioBase64) {
@@ -1145,7 +1150,7 @@ class YouTubeTranslator {
 
   _startQueueScheduler() {
     if (this._queueTimer) return;
-    this._queueTimer = setInterval(() => this._checkQueue(), 300);
+    this._queueTimer = setInterval(() => this._checkQueue(), 50);
   }
 
   _stopQueueScheduler() {
@@ -1156,51 +1161,83 @@ class YouTubeTranslator {
   }
 
   _checkQueue() {
-    if (this.isPlayingAudio || !this.audioQueue.length) return;
+    if (!this.audioQueue.length) return;
     const videoTime = this.video?.currentTime ?? 0;
+    const videoPaused = this.video?.paused ?? false;
 
-    // Убираем полностью устаревшие сегменты (окно давно прошло)
+    // Синхронизация паузы: если видео на паузе — TTS тоже
+    if (this._currentAudio) {
+      if (videoPaused && !this._currentAudio.paused) {
+        this._currentAudio.pause();
+      } else if (!videoPaused && this._currentAudio.paused && this._currentAudio._yttPlaying) {
+        this._currentAudio.play().catch(() => {});
+      }
+    }
+
+    if (videoPaused) return;
+
+    // Убираем полностью устаревшие сегменты (конец окна + 1с уже прошёл)
     this.audioQueue = this.audioQueue.filter(s => {
       const windowEnd = s.startTime + (s.duration || 5);
-      return windowEnd + 2 >= videoTime;
+      return windowEnd + 1 >= videoTime;
     });
     if (!this.audioQueue.length) return;
 
-    // Все кандидаты — сегменты, у которых startTime уже наступил (+ 0.5с lookahead)
-    // Берём САМЫЙ ПОЗДНИЙ из них: если несколько накопилось — пропускаем устаревшие
-    let playIdx = -1;
-    for (let i = 0; i < this.audioQueue.length; i++) {
-      if (this.audioQueue[i].startTime <= videoTime + 0.5) playIdx = i;
-      else break; // очередь отсортирована, дальше только будущие
-    }
-    if (playIdx === -1) return;
+    // Ищем сегмент, чьё время наступило
+    const nextSeg = this.audioQueue[0];
+    if (nextSeg.startTime > videoTime + 0.1) return; // ещё рано
 
-    // Удаляем все сегменты ДО выбранного (они уже неактуальны)
+    // Если текущий аудио ещё играет — проверяем, не пора ли его прервать
+    if (this._currentAudio && this._currentSegment) {
+      const curEnd = this._currentSegment.startTime + (this._currentSegment.duration || 5);
+      // Прерываем только если текущий сегмент уже вышел за своё окно
+      if (videoTime < curEnd) return; // текущий ещё в своём окне — не прерываем
+      // Окно текущего кончилось — прерываем и переходим к следующему
+      this._interruptCurrentAudio();
+    }
+
+    // Если аудио ещё играет (не прервали) — не начинаем новый
+    if (this._currentAudio) return;
+
+    // Убираем все устаревшие до текущего момента, берём ближайший к videoTime
+    let playIdx = 0;
+    for (let i = 1; i < this.audioQueue.length; i++) {
+      if (this.audioQueue[i].startTime <= videoTime + 0.1) playIdx = i;
+      else break;
+    }
     if (playIdx > 0)
-      console.log(`[YTT] Пропускаем ${playIdx} устаревших, берём t=${this.audioQueue[playIdx].startTime.toFixed(1)}s`);
+      console.log(`[YTT] Пропускаем ${playIdx} устаревших`);
+
     const segment = this.audioQueue[playIdx];
     this.audioQueue.splice(0, playIdx + 1);
 
     console.log(`[YTT] Play: "${segment.text.substring(0, 40)}" ` +
-                `@ video=${videoTime.toFixed(1)}s start=${segment.startTime.toFixed(1)}s`);
+                `@ video=${videoTime.toFixed(1)}s seg=[${segment.startTime.toFixed(1)}s..${(segment.startTime + (segment.duration||5)).toFixed(1)}s]`);
     this._playSegment(segment);
   }
 
-  async _playSegment(segment) {
-    const videoRate  = this.video?.playbackRate ?? 1;
-    const videoTime  = this.video?.currentTime ?? 0;
-    const drift      = videoTime - segment.startTime; // > 0 → мы опаздываем
+  _interruptCurrentAudio() {
+    if (this._currentAudio) {
+      this._currentAudio._yttPlaying = false;
+      this._currentAudio.pause();
+      this._currentAudio = null;
+    }
+    this._currentSegment = null;
+    this._setSubtitle('');
+  }
 
-    // Rate-fitting: ускоряем максимум до 1.4x — лучше запоздать, чем трещотка
+  _playSegment(segment) {
+    const videoRate = this.video?.playbackRate ?? 1;
+
+    // Rate-fitting: вписываем TTS ровно в окно сегмента
+    // rate = audioDuration / segmentDuration — точное вписывание
     let rate = videoRate;
     if (segment.audioDuration > 0 && segment.duration > 0) {
-      // Не сжимаем окно ниже 70% от исходной длительности сегмента
-      const effectiveDuration = Math.max(segment.duration * 0.7, segment.duration - Math.max(0, drift));
-      rate = (segment.audioDuration / effectiveDuration) * videoRate;
-      rate = Math.min(1.4, Math.max(videoRate, rate));
+      rate = (segment.audioDuration / segment.duration) * videoRate;
+      // Ограничиваем только крайние случаи: речь понятна до 2.5x
+      rate = Math.min(2.5, Math.max(0.7, rate));
     }
 
-    this.isPlayingAudio  = true;
     this._currentSegment = segment;
     this._setSubtitle(segment.text);
 
@@ -1208,40 +1245,34 @@ class YouTubeTranslator {
       const audio = new Audio(`data:audio/mp3;base64,${segment.audioBase64}`);
       audio.playbackRate = rate;
       audio.volume       = this._transVolume;
+      audio._yttPlaying  = true; // флаг что мы его запустили (для паузы)
       this._currentAudio = audio;
 
-      await new Promise(r => {
-        let syncInterval = null;
-        const cleanup = () => {
-          if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
-          r();
-        };
+      audio.onended = () => {
+        if (this._currentAudio === audio) {
+          this._currentAudio   = null;
+          this._currentSegment = null;
+          this._setSubtitle('');
+        }
+      };
+      audio.onerror = () => {
+        if (this._currentAudio === audio) {
+          this._currentAudio   = null;
+          this._currentSegment = null;
+          this._setSubtitle('');
+        }
+      };
 
-        audio.onended = cleanup;
-        audio.onerror = cleanup;
-
-        // Полинг каждые 80мс: синхронизируем паузу TTS с паузой видео
-        syncInterval = setInterval(() => {
-          // Если аудио уже не текущее — очищаемся
-          if (this._currentAudio !== audio) { cleanup(); return; }
-          const videoPaused = this.video?.paused ?? false;
-          if (videoPaused && !audio.paused) {
-            audio.pause();
-          } else if (!videoPaused && audio.paused) {
-            audio.play().catch(() => {});
-          }
-        }, 80);
-
-        audio.play().catch(() => cleanup());
+      audio.play().catch(() => {
+        this._currentAudio   = null;
+        this._currentSegment = null;
+        this._setSubtitle('');
       });
     } catch (e) {
       console.error('[YTT] Audio error:', e);
+      this._currentAudio   = null;
+      this._currentSegment = null;
     }
-
-    this._currentAudio   = null;
-    this._currentSegment = null;
-    this.isPlayingAudio  = false;
-    this._setSubtitle('');
   }
 
   _onVideoRateChange(newVideoRate) {
@@ -1250,21 +1281,15 @@ class YouTubeTranslator {
     let rate  = newVideoRate;
     if (seg.audioDuration > 0 && seg.duration > 0) {
       rate = (seg.audioDuration / seg.duration) * newVideoRate;
-      rate = Math.min(2.5, Math.max(newVideoRate, rate));
+      rate = Math.min(2.5, Math.max(0.7, rate));
     }
-    console.log(`[YTT] Rate update → ${newVideoRate.toFixed(2)}x: audio=${rate.toFixed(2)}x`);
     this._currentAudio.playbackRate = rate;
   }
 
   _clearAudio() {
-    this.audioQueue     = [];
-    this.isPlayingAudio = false;
+    this.audioQueue = [];
     this._stopQueueScheduler();
-    if (this._currentAudio) {
-      this._currentAudio.pause();
-      this._currentAudio = null;
-    }
-    this._currentSegment = null;
+    this._interruptCurrentAudio();
   }
 
   // ── Spinner (стадии обработки) ────────────────────────────────────────────

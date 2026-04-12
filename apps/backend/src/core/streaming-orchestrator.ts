@@ -39,8 +39,6 @@ export class StreamingOrchestrator extends EventEmitter {
   private static readonly WAIT_POLL_MS = 500;
   /** Задержка перед retry при ошибке перевода/TTS (мс) */
   private static readonly RETRY_DELAY_MS = 500;
-  /** Максимальная длина предложения при разбиении (символов) */
-  private static readonly MAX_SENTENCE_LENGTH = 120;
   /** Длительность сегмента по умолчанию если не указана (сек) */
   private static readonly DEFAULT_SEGMENT_DURATION_SEC = 5;
   /** Сколько секунд "в прошлом" допускается для сегмента */
@@ -329,9 +327,11 @@ export class StreamingOrchestrator extends EventEmitter {
       // Повторная проверка после ожидания
       if (!this.isRunning || this.subtitlePipelineVersion !== myVersion) return;
 
-      await Promise.all(
-        batch.map(sub => this.processSegment(sub.text, sub.startTime, sub.duration, 'unknown'))
-      );
+      // Обрабатываем сегменты последовательно — порядок по таймкодам критичен для клиента
+      for (const sub of batch) {
+        if (!this.isRunning || this.subtitlePipelineVersion !== myVersion) return;
+        await this.processSegment(sub.text, sub.startTime, sub.duration, 'unknown');
+      }
     }
 
     if (this.isRunning && this.subtitlePipelineVersion === myVersion) {
@@ -379,26 +379,6 @@ export class StreamingOrchestrator extends EventEmitter {
     this.emit('status', 'Запуск распознавания...');
   }
 
-  private splitIntoSentences(text: string): string[] {
-    const raw = text.match(/[^.!?]+[.!?]+/g) || [text];
-    const result: string[] = [];
-    let current = '';
-
-    for (const sentence of raw) {
-      const trimmed = sentence.trim();
-      if (!trimmed) continue;
-
-      if (current.length + trimmed.length > StreamingOrchestrator.MAX_SENTENCE_LENGTH && current.length > 0) {
-        result.push(current.trim());
-        current = trimmed;
-      } else {
-        current += (current ? ' ' : '') + trimmed;
-      }
-    }
-    if (current.trim()) result.push(current.trim());
-    return result.length > 0 ? result : [text];
-  }
-
   private async processSegment(text: string, startTime: number, duration?: number, gender?: SpeakerGender): Promise<void> {
     if (!this.translationProvider || !this.ttsProvider || !this.isRunning) return;
 
@@ -436,69 +416,53 @@ export class StreamingOrchestrator extends EventEmitter {
 
     if (!translatedText?.trim()) return;
 
-    // Разбиваем на предложения
-    const sentences = this.splitIntoSentences(translatedText);
-    const segDuration = (duration || StreamingOrchestrator.DEFAULT_SEGMENT_DURATION_SEC) / sentences.length;
+    const segDuration = duration || StreamingOrchestrator.DEFAULT_SEGMENT_DURATION_SEC;
 
-    for (let i = 0; i < sentences.length; i++) {
-      if (!this.isRunning) return;
-
-      const sentenceText = sentences[i];
-      const sentenceStartTime = startTime + i * segDuration;
-
-      // Пропуск предложений, которые уже в прошлом
-      if (this.firstSegmentSent && sentenceStartTime + segDuration < this.playbackTime - StreamingOrchestrator.STALE_SEGMENT_THRESHOLD_SEC) {
-        console.log(`[StreamingOrch] Пропуск предложения @ ${sentenceStartTime.toFixed(1)}s`);
-        continue;
-      }
-
-      // TTS с 1 retry; при провале — отправляем сегмент без аудио (только субтитр)
-      if (!this.firstSegmentSent) this.emit('status', 'Озвучивание…');
-      let audioBuffer: Buffer = Buffer.alloc(0);
+    // TTS с 1 retry; при провале — отправляем сегмент без аудио (только субтитр)
+    if (!this.firstSegmentSent) this.emit('status', 'Озвучивание…');
+    let audioBuffer: Buffer = Buffer.alloc(0);
+    try {
+      audioBuffer = await this.ttsProvider.synthesize(translatedText, gender);
+    } catch (error) {
+      console.warn(`[StreamingOrch] TTS fail #1, retry через 500мс:`, error);
+      await new Promise(r => setTimeout(r, StreamingOrchestrator.RETRY_DELAY_MS));
       try {
-        audioBuffer = await this.ttsProvider.synthesize(sentenceText, gender);
-      } catch (error) {
-        console.warn(`[StreamingOrch] TTS fail #1, retry через 500мс:`, error);
-        await new Promise(r => setTimeout(r, StreamingOrchestrator.RETRY_DELAY_MS));
-        try {
-          audioBuffer = await this.ttsProvider.synthesize(sentenceText, gender);
-        } catch (retryError) {
-          console.error(`[StreamingOrch] TTS fail #2, отправляем без аудио @ ${sentenceStartTime.toFixed(1)}s:`, retryError);
-          this.consecutiveErrors++;
-        }
+        audioBuffer = await this.ttsProvider.synthesize(translatedText, gender);
+      } catch (retryError) {
+        console.error(`[StreamingOrch] TTS fail #2, отправляем без аудио @ ${startTime.toFixed(1)}s:`, retryError);
+        this.consecutiveErrors++;
       }
-
-      // Измеряем реальную длину TTS аудио для rate-fitting на клиенте
-      const audioDuration = audioBuffer.length > 0
-        ? getMp3Duration(audioBuffer)
-        : 0;
-
-      const segment: TranslationSegment = {
-        id: uuidv4(),
-        text: sentenceText,
-        startTime: sentenceStartTime,
-        duration: segDuration,
-        audioDuration,
-        audioBase64: audioBuffer.length > 0 ? audioBuffer.toString('base64') : '',
-      };
-
-      this.segmentCounter++;
-      // Успешный сегмент С аудио сбрасывает счётчик ошибок
-      if (audioBuffer.length > 0) {
-        this.consecutiveErrors = 0;
-      }
-      this.emit('segment', segment);
-
-      if (!this.firstSegmentSent) {
-        this.firstSegmentSent = true;
-        this.clearResumeTimeout();
-        this.emit('resume_video');
-        this.emit('status', 'Перевод активен');
-        console.log('[StreamingOrch] Первый сегмент → resume_video');
-      }
-
-      console.log(`[StreamingOrch] #${this.segmentCounter}: "${sentenceText.substring(0, 50)}" [${gender}] @ ${sentenceStartTime.toFixed(1)}s (video @ ${this.playbackTime.toFixed(1)}s)`);
     }
+
+    // Измеряем реальную длину TTS аудио для rate-fitting на клиенте
+    const audioDuration = audioBuffer.length > 0
+      ? getMp3Duration(audioBuffer)
+      : 0;
+
+    const segment: TranslationSegment = {
+      id: uuidv4(),
+      text: translatedText,
+      startTime,
+      duration: segDuration,
+      audioDuration,
+      audioBase64: audioBuffer.length > 0 ? audioBuffer.toString('base64') : '',
+    };
+
+    this.segmentCounter++;
+    if (audioBuffer.length > 0) {
+      this.consecutiveErrors = 0;
+    }
+    this.emit('segment', segment);
+
+    if (!this.firstSegmentSent) {
+      this.firstSegmentSent = true;
+      this.clearResumeTimeout();
+      this.emit('resume_video');
+      this.emit('status', 'Перевод активен');
+      console.log('[StreamingOrch] Первый сегмент → resume_video');
+    }
+
+    console.log(`[StreamingOrch] #${this.segmentCounter}: "${translatedText.substring(0, 50)}" [${gender}] @ ${startTime.toFixed(1)}s dur=${segDuration.toFixed(1)}s audioDur=${audioDuration.toFixed(1)}s (video @ ${this.playbackTime.toFixed(1)}s)`);
   }
 
   /**
