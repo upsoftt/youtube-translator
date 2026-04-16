@@ -52,7 +52,7 @@ func main() {
 	web.NewRoutes(app, cfg)
 
 	// WebSocket
-	wsHandler := ws.NewHandler(sessionManager)
+	wsHandler := ws.NewHandler(sessionManager, cfg)
 	app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
@@ -147,16 +147,15 @@ func splitFields(s string) []string {
 func printBanner(cfg *config.Config) {
 	fmt.Println()
 	fmt.Println("  ┌─────────────────────────────────────────┐")
-	fmt.Println("  │          YouTube Translator v2.0         │")
-	fmt.Println("  │              Go + HTMX                   │")
+	fmt.Println("  │       YouTube Translator v2.0 (Go)       │")
+	fmt.Println("  │       Chrome Extension Backend            │")
 	fmt.Println("  │                                          │")
-	fmt.Printf("  │  HTTP:      http://%s:%d        │\n", cfg.Host, cfg.Port)
+	fmt.Printf("  │  API:       http://%s:%d        │\n", cfg.Host, cfg.Port)
 	fmt.Printf("  │  WebSocket: ws://%s:%d/ws      │\n", cfg.Host, cfg.Port)
 	fmt.Println("  │                                          │")
-	fmt.Printf("  │  Провайдеры по умолчанию:                │\n")
-	fmt.Printf("  │    STT:         %-24s│\n", cfg.DefaultSTT)
-	fmt.Printf("  │    Translation: %-24s│\n", cfg.DefaultTranslation)
-	fmt.Printf("  │    TTS:         %-24s│\n", cfg.DefaultTTS)
+	fmt.Printf("  │  STT:         %-24s│\n", cfg.DefaultSTT)
+	fmt.Printf("  │  Translation: %-24s│\n", cfg.DefaultTranslation)
+	fmt.Printf("  │  TTS:         %-24s│\n", cfg.DefaultTTS)
 	fmt.Println("  └─────────────────────────────────────────┘")
 	fmt.Println()
 }

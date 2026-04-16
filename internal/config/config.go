@@ -29,7 +29,7 @@ type Config struct {
 // Load загружает конфигурацию из переменных окружения
 func Load() *Config {
 	c := &Config{
-		Port:               getEnvInt("PORT", 8212),
+		Port:               getEnvInt("PORT", 8211),
 		Host:               getEnv("HOST", "0.0.0.0"),
 		YtdlpPath:          getEnv("YTDLP_PATH", "yt-dlp"),
 		FfmpegPath:         getEnv("FFMPEG_PATH", "ffmpeg"),

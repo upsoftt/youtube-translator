@@ -6,9 +6,10 @@
  * с управлением переводом, громкостью и языком.
  */
 
-// ─── Minimal Socket.IO v4 client ─────────────────────────────────────────────
+// ─── Native WebSocket client (JSON protocol) ────────────────────────────────
+// Формат сообщений: { type: "event_name", data: {...} }
 
-class MinimalSocketIO {
+class WsClient {
   constructor(url) {
     this.url       = url;
     this.ws        = null;
@@ -16,8 +17,7 @@ class MinimalSocketIO {
   }
 
   connect() {
-    const wsUrl = this.url.replace(/^http/, 'ws') +
-      '/socket.io/?EIO=4&transport=websocket';
+    const wsUrl = this.url.replace(/^http/, 'ws') + '/ws';
     try {
       this.ws = new WebSocket(wsUrl);
     } catch (e) {
@@ -25,22 +25,13 @@ class MinimalSocketIO {
       return;
     }
 
-    this.ws.onopen    = () => { this.ws.send('40'); };
+    this.ws.onopen = () => { this._emit('connect'); };
     this.ws.onmessage = ({ data }) => {
-      if (!data || !data.length) return;
-      const eioType = parseInt(data[0], 10);
-      if (eioType === 2) { this.ws.send('3'); return; }
-      if (eioType === 4) {
-        const sioType = parseInt(data[1], 10);
-        if (sioType === 0) { this._emit('connect'); return; }
-        if (sioType === 2) {
-          try {
-            const [event, ...args] = JSON.parse(data.slice(2));
-            this._emit(event, ...args);
-          } catch (e) {
-            console.error('[YTT] Parse error:', e, data.slice(0, 80));
-          }
-        }
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type) this._emit(msg.type, msg.data);
+      } catch (e) {
+        console.error('[YTT] Parse error:', e);
       }
     };
     this.ws.onclose = () => { this._emit('disconnect'); };
@@ -49,9 +40,9 @@ class MinimalSocketIO {
 
   on(event, handler)   { this._handlers[event] = handler; return this; }
   off(event)           { delete this._handlers[event]; }
-  emit(event, ...args) {
+  emit(event, data) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN)
-      this.ws.send('42' + JSON.stringify([event, ...args]));
+      this.ws.send(JSON.stringify({ type: event, data: data || {} }));
   }
   disconnect() { if (this.ws) { this.ws.close(); this.ws = null; } }
   _emit(event, ...args) {
@@ -122,7 +113,7 @@ class YouTubeTranslator {
       const res  = await fetch(url, { signal: AbortSignal.timeout(4000) });
       if (!res.ok) return null;
       const data = await res.json();
-      return data.providers || null;
+      return Array.isArray(data) ? data : (data.providers || null);
     } catch {
       return null;
     }
@@ -1039,7 +1030,7 @@ class YouTubeTranslator {
     this.video?.pause();
     this._setStatus('connecting');
 
-    const socket = new MinimalSocketIO(this.settings.backendUrl);
+    const socket = new WsClient(this.settings.backendUrl);
 
     socket.on('connect', () => {
       if (!this._pendingStart) return;
